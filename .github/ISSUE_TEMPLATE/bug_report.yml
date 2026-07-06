@@ -1,0 +1,79 @@
+name: 不具合報告
+description: うまく動かない・エラーが出るなどの報告はこちら
+title: "[不具合] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ご報告ありがとうございます。分かる範囲で構いませんので、以下にご記入ください。
+  - type: input
+    id: school
+    attributes:
+      label: 学校名
+    validations:
+      required: true
+  - type: input
+    id: contact
+    attributes:
+      label: お名前・担当
+      placeholder: "例：教務 ××／情報担当 ××"
+    validations:
+      required: false
+  - type: input
+    id: email
+    attributes:
+      label: 連絡先メールアドレス（返信が必要な場合のみ）
+    validations:
+      required: false
+  - type: dropdown
+    id: feature
+    attributes:
+      label: どの画面・機能についてですか
+      multiple: true
+      options:
+        - 基本時間割の作成・編集
+        - 週間日課変更（振替・補欠・行事など）
+        - 重複の検出・解消パネル
+        - 会議管理
+        - 集計
+        - URL管理（閲覧URLの発行）
+        - バックアップ・復元
+        - 初期設定（学級・教科・教員など）
+        - その他
+    validations:
+      required: false
+  - type: textarea
+    id: details
+    attributes:
+      label: 内容を詳しく教えてください
+      description: 何をしたくて、今どう不便か、具体的な場面が分かると助かります
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: どんな操作をしたら起きましたか（再現の手順）
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: false
+  - type: input
+    id: environment
+    attributes:
+      label: 使っている環境（任意）
+      placeholder: "例：端末（PC／タブレット）、ブラウザ（Chrome／Edge）、バージョン（例：8_7_34）"
+    validations:
+      required: false
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 優先度（あなたの感覚で）
+      options:
+        - 困っている（早く対応してほしい）
+        - あると嬉しい
+        - 気づいたこと程度
+    validations:
+      required: false
