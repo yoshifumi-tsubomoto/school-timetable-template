@@ -15,7 +15,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_34";
+const APP_VERSION="8_7_39";
 
 // ── Supabase Auth クライアント（CDN動的ロード） ───────────────────────────────
 // パッケージ依存を増やさず、Google Identity Services と同じく CDN から読み込む。
@@ -45,7 +45,7 @@ const getSupabaseClient=()=>{
     }
     const s=document.createElement("script");
     s.id="supabase-js-script";
-    s.src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js";
+    s.src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.110.0/dist/umd/supabase.min.js";
     s.async=true;
     s.onload=make;
     s.onerror=()=>reject(new Error("supabase-js の読み込みに失敗しました"));
@@ -150,9 +150,13 @@ const sbSaveToken=async(token,type,classId=null)=>
   });
 
 const sbGetToken=async(token)=>{
-  const res=await sbFetch(`/rest/v1/timetable_tokens?token=eq.${token}`);
+  // 【v8_7_35】anonによるトークン全件読取を廃止し、完全一致のみ返すRPC経由に変更
+  const res=await sbFetch('/rest/v1/rpc/token_lookup',{
+    method:'POST',
+    body:JSON.stringify({p_token:token}),
+  });
   const rows=await res.json();
-  return rows[0]||null;
+  return Array.isArray(rows)?(rows[0]||null):null;
 };
 
 const sbListTokens=async()=>{
@@ -186,7 +190,14 @@ const sbGetPublished=async()=>{
   return rows[0]?.data||null;
 };
 
-const genToken=()=>Math.random().toString(36).slice(2,10)+Math.random().toString(36).slice(2,6);
+const genToken=()=>{
+  // 【v8_7_35】暗号学的乱数で24文字（約120bit）。紛らわしい文字 l,o,0,1 は除外。
+  // 32文字アルファベット×b%32 なので剰余の偏りなし。
+  const alphabet="abcdefghijkmnpqrstuvwxyz23456789";
+  const bytes=new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes,b=>alphabet[b%32]).join("");
+};
 
 const shortenUrl=async(url)=>{
   try{
@@ -873,6 +884,8 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const[fillHoleModal,setFillHoleModal]=useState(null);
   // ── ドラッグ中の3コマ候補ハイライト ──────────────────────────────────────
   const chainCandidatesRef=useRef([]);
+  // 【v8_7_36】computeChainCandidates は dragAnalysis より後ろで定義されるため、ref 経由で参照する（定義前参照＝TDZエラーの回避）
+  const computeChainRef=useRef(null);
   const[chainVersion,setChainVersion]=useState(0);
   const chainTimerRef=useRef(null);
 
@@ -901,6 +914,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const redoRef=useRef([]);
   const currentRef=useRef({base,changes,dayPatterns});
   currentRef.current={base,changes,dayPatterns};
+  const nameRef=useRef({classes:[],teachers:[]});nameRef.current={classes,teachers}; // 【v8_7_37】取消/やり直しの説明用（ショートカットは古いクロージャで動くのでrefで読む）
   // トライアルパネル（衝突解消）開始前の状態スナップショット。やり直し/キャンセルで確実に復元する用。
   const trialSnapRef=useRef(null);
   const mainPlacedRef=useRef(false); // 重複解消パネルで主役を配置済みか
@@ -913,11 +927,21 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     if(isDemo){setDbLoaded(true);return;} // 体験版: DB読み込みせずコード内のサンプルデータを使用
     (async()=>{
       try{
-        const endpoint=usePublished
-          ?'/rest/v1/timetable_published?id=eq.main'
-          :'/rest/v1/timetable_data?id=eq.main';
-        const res=await sbFetch(endpoint);
-        const rows=await res.json();
+        // 【v8_7_35】閲覧（公開データ）はトークン検証付きRPC経由で取得する。
+        // usePublished=true はトークンアクセス時のみ渡される（外側でトークン検証済み）。
+        let rows;
+        if(usePublished){
+          const t=(()=>{try{return new URLSearchParams(window.location.search).get("t");}catch(_){return null;}})();
+          const res=await sbFetch('/rest/v1/rpc/published_by_token',{
+            method:'POST',
+            body:JSON.stringify({p_token:t}),
+          });
+          rows=await res.json();
+          if(!Array.isArray(rows))rows=[];
+        }else{
+          const res=await sbFetch('/rest/v1/timetable_data?id=eq.main');
+          rows=await res.json();
+        }
         const d=rows[0]?.data||{};
         if(usePublished&&rows[0]?.published_at) setPublishedAt(rows[0].published_at);
         if(d.base?.length)      setBase(d.base);
@@ -1754,8 +1778,20 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             const swapTeacherConflict=srcOccupants.some(e=>(e.teacherIds||[]).some(tid=>tgtTidsArr.includes(tid)));
             const swapTchUnavail=tgtTidsArr.some(tid=>{const t=teachers.find(x=>x.id===tid);return t&&!isSlotAvailable(t,srcDay,srcPeriod,srcDate,teacherDateOverrides);});
             if(swapClassConflict.length>0||swapTeacherConflict||swapTchUnavail){
-              // 入れ替えると移動元で重複が出る → swapにせず重複として表示
-              result[hk]={type:"conflict",conflictClasses:[...new Set(swapClassConflict)],unavailTids:[],conflictEntries:[tgt],swapBlocked:true};
+              // 入れ替えると移動元で重複が出る → 通常は重複として表示。
+              // 【v8_7_36】ただし重複の理由が移動元の学級/先生の重なりで、3コマ回転の候補があるなら紫(rotate)で示す。
+              //   （変更コマ数の少ない順：空きへ移動1 ＜ 1対1入替2(黄) ＜ 3コマ回転3(紫)。1対1が成立するセルは従来どおり黄のまま）
+              //   ドロップ時の判定（directSwapConflicts＋computeChainCandidates）と同じ条件に揃えている。
+              let _rotCands=[];
+              if((swapClassConflict.length>0||swapTeacherConflict)&&!tgt._removed&&computeChainRef.current
+                &&(srcCell.entry.classIds||[]).some(c=>tgtCidsArr.includes(c))){
+                try{_rotCands=computeChainRef.current(srcCell.entry,srcCell.dc,tgt,dc)||[];}catch(e){_rotCands=[];}
+              }
+              if(_rotCands.length>0){
+                result[hk]={type:"rotate",rotateSubject:tgt.subject||"",rotateCount:_rotCands.length};
+              }else{
+                result[hk]={type:"conflict",conflictClasses:[...new Set(swapClassConflict)],unavailTids:[],conflictEntries:[tgt],swapBlocked:true};
+              }
             }else{
               result[hk]={type:"swap",swapSubject:tgt.subject||"",swapClasses:tgt.classIds||[]};
             }
@@ -2234,9 +2270,52 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     }
   };
 
+  // 【v8_7_37】from→to の変化（=行った操作）を日本語で説明する。取消/やり直しのボタン説明・通知に使う。
+  const describeOp=(from,to)=>{
+    if(!from||!to)return"変更";
+    const cn=nameRef.current.classes||[];
+    const lab=e=>`${e.subject||"授業"}${(e.classIds||[]).length?"（"+(e.classIds||[]).map(c=>cn.find(x=>x.id===c)?.name||c).join("・")+"）":""}`;
+    const bslot=e=>e.day&&e.period?`${e.day}${e.period}限`:"待機";
+    const WD=["日","月","火","水","木","金","土"];
+    const dslot=e=>{const d=new Date(e.date+"T00:00:00");return`${d.getMonth()+1}/${d.getDate()}（${WD[d.getDay()]}）${e.period}限`;};
+    const parts=[];
+    const diffList=(A,B)=>{const am=new Map((A||[]).filter(Boolean).map(e=>[e.id,e])),bm=new Map((B||[]).filter(Boolean).map(e=>[e.id,e]));
+      return{added:[...bm.values()].filter(e=>!am.has(e.id)),removed:[...am.values()].filter(e=>!bm.has(e.id)),both:[...bm.values()].filter(e=>am.has(e.id)).map(e=>[am.get(e.id),e])};};
+    // 基本時間割
+    const bd=diffList(from.base,to.base);
+    const moved=bd.both.filter(([a,b])=>a.day!==b.day||a.period!==b.period);
+    const edited=bd.both.filter(([a,b])=>(a.day===b.day&&a.period===b.period)&&JSON.stringify(a)!==JSON.stringify(b));
+    if(moved.length===2&&bslot(moved[0][0])===bslot(moved[1][1])&&bslot(moved[0][1])===bslot(moved[1][0]))
+      parts.push(`${lab(moved[0][1])}と${lab(moved[1][1])}の入れ替え（${bslot(moved[0][0])}⇄${bslot(moved[1][0])}）`);
+    else if(moved.length===3)parts.push(`3コマ回転（${moved.map(([,b])=>lab(b)).join("・")}）`);
+    else if(moved.length===1)parts.push(`${lab(moved[0][1])}を${bslot(moved[0][0])}から${bslot(moved[0][1])}へ移動`);
+    else if(moved.length>1)parts.push(`${moved.length}コマの移動`);
+    if(bd.added.length)parts.push(bd.added.length===1?`${lab(bd.added[0])}の追加`:`${bd.added.length}コマの追加`);
+    if(bd.removed.length)parts.push(bd.removed.length===1?`${lab(bd.removed[0])}の削除`:`${bd.removed.length}コマの削除`);
+    if(edited.length)parts.push(edited.length===1?`${lab(edited[0][1])}の内容変更`:`${edited.length}コマの内容変更`);
+    // 日付つき変更
+    const cd=diffList(from.changes,to.changes);
+    const cAddL=cd.added.filter(c=>!c._removed&&!c.isBlocked),cAddR=cd.added.filter(c=>c._removed);
+    const cDel=cd.removed.filter(c=>!c._removed);
+    const cEd=cd.both.filter(([a,b])=>JSON.stringify(a)!==JSON.stringify(b));
+    if(cAddL.length){
+      const rot=cAddL.some(c=>String(c.note||"").includes("3コマ回転"))||cAddL.length===3;
+      const dt=cAddL[0].date?`（${dslot(cAddL[0])}ほか）`:"";
+      parts.push(rot?`日付つきの3コマ回転${dt}`:cAddL.length===2?`日付つきの入れ替え${dt}`:cAddL.length===1?`日付つき変更：${lab(cAddL[0])}（${dslot(cAddL[0])}）`:`日付つき変更${cAddL.length}件の追加`);
+    }else if(cAddR.length)parts.push(`日付つきの授業の取り除き${cAddR.length}件`);
+    if(cDel.length)parts.push(`日付つき変更${cDel.length}件の取消`);
+    if(cEd.length&&!cAddL.length)parts.push(`日付つき変更${cEd.length}件の修正`);
+    if(JSON.stringify(from.dayPatterns)!==JSON.stringify(to.dayPatterns))parts.push("日課パターンの変更");
+    return parts.length?parts.join("／"):"変更";
+  };
+  // 次に取り消す／やり直す操作の説明
+  const undoTip=()=>{const h=historyRef.current;if(!h.length)return"取り消せる操作はありません（Ctrl+Z）";return`元に戻す（Ctrl+Z）\n戻す操作：${describeOp(h[h.length-1],currentRef.current)}`;};
+  const redoTip=()=>{const r=redoRef.current;if(!r.length)return"やり直せる操作はありません（Ctrl+Y）";return`やり直す（Ctrl+Y）\nやり直す操作：${describeOp(currentRef.current,r[r.length-1])}`;};
+
   const undo=()=>{
-    if(historyRef.current.length===0)return;
+    if(historyRef.current.length===0){showMoveNotice('↩ これ以上取り消せません',[]);return;}
     const prev=historyRef.current[historyRef.current.length-1];
+    showMoveNotice('↩ 取り消しました',[describeOp(prev,currentRef.current)]);
     historyRef.current=historyRef.current.slice(0,-1);
     redoRef.current=[...redoRef.current,JSON.parse(JSON.stringify(currentRef.current))];
     skipHistoryRef.current=true; // undo/redoはuseEffectの自動履歴保存をスキップ
@@ -2246,8 +2325,9 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     setHistoryLen(historyRef.current.length);
   };
   const redo=()=>{
-    if(redoRef.current.length===0)return;
+    if(redoRef.current.length===0){showMoveNotice('↪ やり直せる操作はありません',[]);return;}
     const next=redoRef.current[redoRef.current.length-1];
+    showMoveNotice('↪ やり直しました',[describeOp(currentRef.current,next)]);
     redoRef.current=redoRef.current.slice(0,-1);
     historyRef.current=[...historyRef.current,JSON.parse(JSON.stringify(currentRef.current))];
     skipHistoryRef.current=true; // undo/redoはuseEffectの自動履歴保存をスキップ
@@ -2273,8 +2353,83 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     return false;
   });
 
+  // 【v8_7_36】3コマ回転の候補探索（週間日課変更＝日付モード用）。
+  //   基本モード版は base の day/period だけを見るため、日付ごとの変更(changes)・日替わりパターン・A/B週を反映できず、
+  //   候補の移動先に日付も入らなかった（実行時に date=null の変更が作られてしまう）。
+  //   ここでは「今週表示中の日付×時限」の実際の占有（occAt。重複解消の occAtV と同じ考え方）で探し、
+  //   候補に移動先 _chainDc={day,period,date} を付ける。参照は ref とモジュール関数のみ（初回レンダー固定のクロージャでも最新値を読む）。
+  const chainCandidatesDateFn=(srcEntry,srcDc,tgtEntry,tgtDc)=>{
+    const sharedCids=(srcEntry.classIds||[]).filter(cid=>(tgtEntry?.classIds||[]).includes(cid));
+    if(sharedCids.length===0)return[];
+    const sv=saveRef.current||{};
+    const baseE=sv.base||[],changesE=sv.changes||[],meetingsL=sv.meetings||[],teachersL=sv.teachers||[],ovr=sv.teacherDateOverrides||[],pats=sv.dayPatterns||[];
+    const bIds=new Set((benchRef.current||[]).filter(Boolean).map(x=>x.id));
+    const ab=abWeekNowRef.current;
+    const abOk=b=>!b.altWeek||!ab||b.altWeek===ab;
+    const patOf=date=>pats.find(dp=>dp.date===date);
+    const patDayOf=(date,pp)=>{const pt=patOf(date);return pt?.periods?.[String(pp)]?.day||pt?.useDay||dowOf(date);};
+    const patPerOf=(date,pp)=>{const pt=patOf(date);const v=pt?.periods?.[String(pp)]?.period;return v!=null?v:pp;};
+    // (日付,時限) に実際にある授業。changes の授業＋（changes で上書き・取消されていない）base の授業
+    const occAt=(dt,pp)=>{
+      const patD=patDayOf(dt,pp),patP=patPerOf(dt,pp);
+      const overridden=new Set(changesE.filter(c=>c.date===dt&&c.period===pp).flatMap(c=>c.classIds||[]));
+      const res=[];
+      changesE.forEach(c=>{if(c._removed||c.isBlocked)return;if(c.date===dt&&c.period===pp)res.push(c);});
+      baseE.forEach(b=>{
+        if(b.isBlocked||bIds.has(b.id)||!abOk(b))return;
+        if(b.day===patD&&b.period===patP&&!(b.classIds||[]).some(cid=>overridden.has(cid)))res.push(b);
+      });
+      return res;
+    };
+    // その枠で出張などで塞がっている先生
+    const blockedTids=(dt,pp)=>{
+      const patD=patDayOf(dt,pp),patP=patPerOf(dt,pp);
+      const st=new Set();
+      changesE.forEach(c=>{if(c.isBlocked&&!c._removed&&c.date===dt&&c.period===pp)(c.teacherIds||[]).forEach(t=>st.add(t));});
+      baseE.forEach(b=>{if(b.isBlocked&&b.day===patD&&b.period===patP)(b.teacherIds||[]).forEach(t=>st.add(t));});
+      return st;
+    };
+    // 先生が(日付,時限)に出勤でき、会議・出張が入っていないか
+    const tOk=(tids,dt,pp)=>{
+      const dow=dowOf(dt);if(!dow)return false;
+      const blk=blockedTids(dt,pp);
+      return(tids||[]).every(tid=>{
+        const t=teachersL.find(x=>x.id===tid);
+        if(t&&!isSlotAvailable(t,dow,pp,dt,ovr))return false;
+        if(meetingsL.some(m=>m.day===dow&&m.period===pp&&(m.teacherIds||[]).includes(tid)))return false;
+        if(blk.has(tid))return false;
+        return true;
+      });
+    };
+    // piece を (dt,pp) に置いたとき、3コマ当事者(involved)以外の授業と学級・先生が重ならないか
+    const fits=(piece,dt,pp,involved)=>{
+      if(!tOk(piece.teacherIds,dt,pp))return false;
+      const cids=new Set(piece.classIds||[]),tids=new Set(piece.teacherIds||[]);
+      return !occAt(dt,pp).some(o=>!involved.has(o.id)&&((o.classIds||[]).some(c=>cids.has(c))||(o.teacherIds||[]).some(t=>tids.has(t))));
+    };
+    const out=[];
+    for(const dt of (datesRef.current||[])){
+      for(const pp of PERIODS){
+        if((dt===srcDc.date&&pp===srcDc.period)||(dt===tgtDc.date&&pp===tgtDc.period))continue;
+        for(const e of occAt(dt,pp)){
+          if(out.length>=5)break;
+          if(e.id===srcEntry.id||e.id===tgtEntry.id)continue;
+          if(!(e.classIds||[]).some(cid=>sharedCids.includes(cid)))continue;
+          const involved=new Set([srcEntry.id,tgtEntry.id,e.id]);
+          if(!fits(tgtEntry,dt,pp,involved))continue;                   // B → C の枠
+          if(!fits(e,srcDc.date,srcDc.period,involved))continue;        // C → A の枠
+          if(!fits(srcEntry,tgtDc.date,tgtDc.period,involved))continue; // A → B の枠
+          out.push({...e,_chainDc:{day:dowOf(dt),period:pp,date:dt}});
+        }
+      }
+    }
+    return out.slice(0,5);
+  };
+
   // 3コマ候補を計算して競合フィルタリング
   const computeChainCandidates=useRef((srcEntry,srcDc,tgtEntry,tgtDc)=>{
+    // 【v8_7_36】週間日課変更（日付モード）は日付つきの占有で探す
+    if(dateModeRef.current&&srcDc?.date&&tgtDc?.date)return chainCandidatesDateFn(srcEntry,srcDc,tgtEntry,tgtDc);
     const sharedCids=(srcEntry.classIds||[]).filter(cid=>(tgtEntry?.classIds||[]).includes(cid));
     if(sharedCids.length===0)return[];
     const srcSlotKey=`${srcDc.day}|${srcDc.period}`;
@@ -2307,6 +2462,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
       return true;
     }).slice(0,5);
   });
+  computeChainRef.current=computeChainCandidates.current; // 【v8_7_36】dragAnalysis から使う
   const executeChainSwap=(srcEntry,srcDc,tgtEntry,tgtDc,cEntry,cDc)=>{
     saveHistory();
     // 3コマ回転前にSupabaseバックアップ（復元可能にする）
@@ -2344,10 +2500,12 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         );
         // A→tgt, B→c, C→src の3コマ分を追加
         u.push({id:ts+0,date:tgtDc.date,period:tgtDc.period,classIds:srcEntry.classIds,teacherIds:srcEntry.teacherIds,subject:srcEntry.subject,isSubst:false,note:"（3コマ回転）"});
-        u.push({id:ts+1,date:srcDc.date,period:srcDc.period,classIds:tgtEntry.classIds,teacherIds:tgtEntry.teacherIds,subject:tgtEntry.subject,isSubst:false,note:"（3コマ回転）"});
-        u.push({id:ts+2,date:cDc.date, period:cDc.period, classIds:cEntry.classIds,  teacherIds:cEntry.teacherIds,  subject:cEntry.subject,  isSubst:false,note:"（3コマ回転）"});
-        // _removed で元ベースを隠す（各エントリ）
-        [[srcEntry,tgtDc],[tgtEntry,cDc],[cEntry,srcDc]].forEach(([e,dc],i)=>{
+        u.push({id:ts+1,date:cDc.date,period:cDc.period,classIds:tgtEntry.classIds,teacherIds:tgtEntry.teacherIds,subject:tgtEntry.subject,isSubst:false,note:"（3コマ回転）"});
+        u.push({id:ts+2,date:srcDc.date, period:srcDc.period, classIds:cEntry.classIds,  teacherIds:cEntry.teacherIds,  subject:cEntry.subject,  isSubst:false,note:"（3コマ回転）"});
+        // 【v8_7_39】_removed で「各駒の元の位置」にある元ベースを隠す（その先生のbaseだけを隠すマーカー）。
+        //   以前は行き先の枠に付けていたため、元の位置の駒が消えずに残っていた。変更(change)の駒は上のfilterで既に除去済み。
+        [[srcEntry,srcDc],[tgtEntry,tgtDc],[cEntry,cDc]].forEach(([e,dc],i)=>{
+          if(e._ch===true)return;
           u.push({id:ts+10+i,date:dc.date,period:dc.period,classIds:e.classIds,teacherIds:e.teacherIds||[],subject:"",isSubst:false,_removed:true,note:""});
         });
         return u;
@@ -3580,13 +3738,13 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         onMouseLeave={()=>setHov(null)}
         className={isTargetPulse?"candidate-target-pulse":isConflictPulse?"conflict-pulse":undefined} style={{padding:0,minWidth:90,height:68,verticalAlign:"top",
           opacity:isDragSrc?0.35:isDragging&&da?.type==="blocked"?0.5:1,
-          outline:isConflictPulse?"none":isDragHov?(da?.type==="conflict"?"3px solid #EF4444":da?.type==="blocked"?"3px solid #9CA3AF":da?.type==="linkwarn"?"3px solid #F59E0B":da?.type==="linkswap"?"3px solid #06B6D4":"3px solid #22C55E"):isRecentMoved?"4px solid #10B981":conflict?"3px solid #EF4444":isLastEdited?"3px solid #6366F1":"none",
+          outline:isConflictPulse?"none":isDragHov?(da?.type==="conflict"?"3px solid #EF4444":da?.type==="blocked"?"3px solid #9CA3AF":da?.type==="linkwarn"?"3px solid #F59E0B":da?.type==="linkswap"?"3px solid #06B6D4":da?.type==="rotate"?"3px solid #7C3AED":"3px solid #22C55E"):isRecentMoved?"4px solid #10B981":conflict?"3px solid #EF4444":isLastEdited?"3px solid #6366F1":"none",
           outlineOffset:"-2px",
           border:conflict?"2px solid #EF4444":"1px solid #E2E8F0",
           borderLeft:isBlk?"3px solid #6B7280":entry?._ch?`3px solid ${entry.isSubst?"#EF4444":"#F59E0B"}`:"1px solid #E2E8F0",
           background:isDragging&&da?(
             da.type==="src"?"#BFDBFE":da.type==="empty"?"#DCFCE7":
-            da.type==="swap"?"#FEF9C3":da.type==="chain"?"#F5F3FF":da.type==="conflict"?"#FEE2E2":da.type==="linkwarn"?"#FEF3C7":da.type==="linkswap"?"#ECFEFF":"#F3F4F6"
+            da.type==="swap"?"#FEF9C3":da.type==="rotate"?"#DDD6FE":da.type==="chain"?"#EDE9FE":da.type==="conflict"?"#FEE2E2":da.type==="linkwarn"?"#FEF3C7":da.type==="linkswap"?"#ECFEFF":"#F3F4F6"
           ):(isBlk?gc(origBase?.subject||"")+"cc":entry?gc(entry.subject):"#FAFBFC"),
           cursor:entry&&!isBlk?"grab":"default",userSelect:"none",
           transition:isDragging?"background 0.08s":"all 0.12s",
@@ -3596,17 +3754,17 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         <div style={{padding:"4px 5px",height:"100%",boxSizing:"border-box",position:"relative"}}>
         {isDragging&&da&&da.type!=="src"&&(
           <div style={{fontSize:9,fontWeight:700,marginBottom:1,
-            color:da.type==="conflict"?"#DC2626":da.type==="empty"?"#16A34A":da.type==="swap"?"#92400E":da.type==="chain"?"#6D28D9":da.type==="linkwarn"?"#B45309":da.type==="linkswap"?"#0E7490":"#9CA3AF"}}>
-            {da.type==="empty"?"✓ 空き":da.type==="swap"?`⇄ ${da.swapSubject}`:da.type==="chain"?`🔄 ${da.chainSubject||""}`:da.type==="conflict"?(da.unavailTids?.length>0?`🚫 不在`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}重複`:"⚠ 先生重複"):da.type==="linkwarn"?`🔗⚠ ${da.linkNames}`:da.type==="linkswap"?`🔗↩ ${da.blockerNames}`:"🚫"}
+            color:da.type==="conflict"?"#DC2626":da.type==="empty"?"#16A34A":da.type==="swap"?"#92400E":da.type==="rotate"?"#5B21B6":da.type==="chain"?"#6D28D9":da.type==="linkwarn"?"#B45309":da.type==="linkswap"?"#0E7490":"#9CA3AF"}}>
+            {da.type==="empty"?"✓ 空き":da.type==="swap"?`⇄ ${da.swapSubject}`:da.type==="rotate"?`🔄 3コマ回転`:da.type==="chain"?`🔄 ${da.chainSubject||""}`:da.type==="conflict"?(da.unavailTids?.length>0?`🚫 不在`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}重複`:"⚠ 先生重複"):da.type==="linkwarn"?`🔗⚠ ${da.linkNames}`:da.type==="linkswap"?`🔗↩ ${da.blockerNames}`:"🚫"}
           </div>
         )}
         {isDragHov&&da&&(
           <div style={{position:"absolute",bottom:"calc(100% + 4px)",left:"50%",transform:"translateX(-50%)",
-            background:da.type==="conflict"?"#7F1D1D":da.type==="linkwarn"?"#92400E":da.type==="linkswap"?"#0E7490":da.type==="empty"?"#14532D":"#1E3A5F",
+            background:da.type==="conflict"?"#7F1D1D":da.type==="linkwarn"?"#92400E":da.type==="linkswap"?"#0E7490":da.type==="empty"?"#14532D":da.type==="rotate"?"#5B21B6":"#1E3A5F",
             color:"white",borderRadius:6,padding:"5px 10px",fontSize:11,whiteSpace:"nowrap",
             zIndex:200,boxShadow:"0 4px 12px rgba(0,0,0,0.25)",pointerEvents:"none"}}>
             {da.type==="empty"&&"✓ ここへ移動（空きコマ）"}
-            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え`}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
+            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
             {da.type==="conflict"&&(da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
             {da.type==="blocked"&&"🚫 空きコマには移動できません"}
             {da.type==="linkwarn"&&`🔗⚠ 連動中の「${da.linkNames}」の移動先も塞がっています → ドロップするとリンクが外れます`}{da.type==="linkswap"&&`🔗↩ ${da.blockerNames}を${da.srcDay}曜${da.srcPeriod}限に退かして連動移動できます`}
@@ -3784,13 +3942,13 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         onMouseLeave={()=>setHov(null)}
         className={isTargetPulse?"candidate-target-pulse":isConflictPulse?"conflict-pulse":undefined} style={{padding:0,minWidth:90,height:68,verticalAlign:"top",
           opacity:isDragSrc?0.35:isDragging&&da?.type==="blocked"?0.5:1,
-          outline:isDragHov?(da?.type==="conflict"?"3px solid #EF4444":da?.type==="blocked"?"3px solid #9CA3AF":da?.type==="linkwarn"?"3px solid #F59E0B":da?.type==="linkswap"?"3px solid #06B6D4":"3px solid #22C55E"):isRecentMoved?"4px solid #10B981":conflict?"3px solid #EF4444":isLastEdited?"3px solid #6366F1":"none",
+          outline:isDragHov?(da?.type==="conflict"?"3px solid #EF4444":da?.type==="blocked"?"3px solid #9CA3AF":da?.type==="linkwarn"?"3px solid #F59E0B":da?.type==="linkswap"?"3px solid #06B6D4":da?.type==="rotate"?"3px solid #7C3AED":"3px solid #22C55E"):isRecentMoved?"4px solid #10B981":conflict?"3px solid #EF4444":isLastEdited?"3px solid #6366F1":"none",
           outlineOffset:"-2px",
           border:conflict?"2px solid #EF4444":"1px solid #E2E8F0",
           borderLeft:isBlk?"3px solid #9CA3AF":meetingBorderColor?`3px solid ${meetingBorderColor}`:first?._ch?`3px solid ${first.isSubst?"#EF4444":"#F59E0B"}`:"1px solid #E2E8F0",
           background:isDragging&&da?(
             da.type==="src"?"#BFDBFE":da.type==="empty"?"#DCFCE7":
-            da.type==="swap"?"#FEF9C3":da.type==="chain"?"#F5F3FF":da.type==="conflict"?"#FEE2E2":da.type==="linkwarn"?"#FEF3C7":da.type==="linkswap"?"#ECFEFF":"#F3F4F6"
+            da.type==="swap"?"#FEF9C3":da.type==="rotate"?"#DDD6FE":da.type==="chain"?"#EDE9FE":da.type==="conflict"?"#FEE2E2":da.type==="linkwarn"?"#FEF3C7":da.type==="linkswap"?"#ECFEFF":"#F3F4F6"
           ):(isBlk?gc(origBases[0]?.subject||"")+"cc":first?gc(first.subject):tchAbsent?"#F9FAFB":"#FAFBFC"),
           cursor:first&&!isBlk&&!tchAbsent?"grab":"default",userSelect:"none",
           transition:isDragging?"background 0.08s":"all 0.12s",position:"relative"}}>
@@ -3799,17 +3957,17 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         <div style={{padding:"4px 5px",height:"100%",boxSizing:"border-box",position:"relative"}}>
         {isDragging&&da&&da.type!=="src"&&(
           <div style={{fontSize:9,fontWeight:700,marginBottom:1,
-            color:da.type==="conflict"?"#DC2626":da.type==="empty"?"#16A34A":da.type==="swap"?"#92400E":da.type==="chain"?"#6D28D9":da.type==="linkwarn"?"#B45309":da.type==="linkswap"?"#0E7490":"#9CA3AF"}}>
-            {da.type==="empty"?"✓ 空き":da.type==="swap"?`⇄ ${da.swapSubject}`:da.type==="chain"?`🔄 ${da.chainSubject||""}`:da.type==="conflict"?(da.unavailTids?.length>0?`🚫 不在`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}重複`:"⚠ 先生重複"):da.type==="linkwarn"?`🔗⚠ ${da.linkNames}`:da.type==="linkswap"?`🔗↩ ${da.blockerNames}`:"🚫"}
+            color:da.type==="conflict"?"#DC2626":da.type==="empty"?"#16A34A":da.type==="swap"?"#92400E":da.type==="rotate"?"#5B21B6":da.type==="chain"?"#6D28D9":da.type==="linkwarn"?"#B45309":da.type==="linkswap"?"#0E7490":"#9CA3AF"}}>
+            {da.type==="empty"?"✓ 空き":da.type==="swap"?`⇄ ${da.swapSubject}`:da.type==="rotate"?`🔄 3コマ回転`:da.type==="chain"?`🔄 ${da.chainSubject||""}`:da.type==="conflict"?(da.unavailTids?.length>0?`🚫 不在`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}重複`:"⚠ 先生重複"):da.type==="linkwarn"?`🔗⚠ ${da.linkNames}`:da.type==="linkswap"?`🔗↩ ${da.blockerNames}`:"🚫"}
           </div>
         )}
         {isDragHov&&da&&(
           <div style={{position:"absolute",bottom:"calc(100% + 4px)",left:"50%",transform:"translateX(-50%)",
-            background:da.type==="conflict"?"#7F1D1D":da.type==="linkwarn"?"#92400E":da.type==="linkswap"?"#0E7490":da.type==="empty"?"#14532D":"#1E3A5F",
+            background:da.type==="conflict"?"#7F1D1D":da.type==="linkwarn"?"#92400E":da.type==="linkswap"?"#0E7490":da.type==="empty"?"#14532D":da.type==="rotate"?"#5B21B6":"#1E3A5F",
             color:"white",borderRadius:6,padding:"5px 10px",fontSize:11,whiteSpace:"nowrap",
             zIndex:200,boxShadow:"0 4px 12px rgba(0,0,0,0.25)",pointerEvents:"none"}}>
             {da.type==="empty"&&"✓ ここへ移動（空きコマ）"}
-            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え`}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
+            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
             {da.type==="conflict"&&(da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
             {da.type==="blocked"&&"🚫 空きコマには移動できません"}
             {da.type==="linkwarn"&&`🔗⚠ 連動中の「${da.linkNames}」の移動先も塞がっています → ドロップするとリンクが外れます`}{da.type==="linkswap"&&`🔗↩ ${da.blockerNames}を${da.srcDay}曜${da.srcPeriod}限に退かして連動移動できます`}
@@ -4054,6 +4212,20 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         </div>
       )}
 
+      {/* 【v8_7_36】ドラッグ中の色の凡例（変更コマ数の少ない順） */}
+      {dragVisual&&(
+        <div style={{position:"fixed",left:"50%",bottom:12,transform:"translateX(-50%)",
+          background:"rgba(255,255,255,0.96)",border:"1.5px solid #CBD5E1",borderRadius:10,
+          padding:"6px 14px",fontSize:11,fontWeight:700,color:"#334155",
+          pointerEvents:"none",zIndex:9998,boxShadow:"0 4px 16px rgba(0,0,0,0.18)",
+          display:"flex",gap:14,alignItems:"center",whiteSpace:"nowrap"}}>
+          <span style={{color:"#64748B",fontWeight:600}}>変更の少ない順</span>
+          {[["#DCFCE7","#22C55E","空きへ移動（1コマ）"],["#FEF9C3","#EAB308","1対1で入替（2コマ）"],["#DDD6FE","#7C3AED","3コマ回転（3コマ）"],["#FEE2E2","#EF4444","重複"]].map(([bg,bd,t])=>(
+            <span key={t}><span style={{display:"inline-block",width:12,height:12,background:bg,border:`2px solid ${bd}`,borderRadius:3,verticalAlign:"-2px",marginRight:5}}/>{t}</span>
+          ))}
+        </div>
+      )}
+
       {/* 🔗 連動移動の通知トースト */}
       {linkNotice&&(
         <div style={{position:"fixed",bottom:80,left:"50%",transform:"translateX(-50%)",
@@ -4132,8 +4304,8 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         <div style={{width:1,height:18,background:"rgba(255,255,255,0.25)",flexShrink:0,margin:"0 2px"}}/>
 
         {/* 操作 */}
-        <button onClick={undo} disabled={historyLen===0} title="元に戻す（Ctrl+Z）" style={{background:historyLen>0?"rgba(255,255,255,0.18)":"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.25)",color:historyLen>0?"white":"rgba(255,255,255,0.35)",padding:"3px 10px",borderRadius:4,cursor:historyLen>0?"pointer":"not-allowed",fontSize:11,flexShrink:0,whiteSpace:"nowrap"}}>↩ 取消{historyLen>0&&<span style={{marginLeft:4,background:"rgba(255,255,255,0.25)",borderRadius:8,padding:"0 5px",fontSize:10}}>{historyLen}</span>}</button>
-        <button onClick={redo} title="やり直す（Ctrl+Y）" style={{background:"rgba(255,255,255,0.12)",border:"1px solid rgba(255,255,255,0.25)",color:"white",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:11,flexShrink:0,whiteSpace:"nowrap"}}>↪ やり直し</button>
+        <button onClick={undo} disabled={historyLen===0} title="元に戻す（Ctrl+Z）" onMouseEnter={e=>{e.currentTarget.title=undoTip();}} style={{background:historyLen>0?"rgba(255,255,255,0.18)":"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.25)",color:historyLen>0?"white":"rgba(255,255,255,0.35)",padding:"3px 10px",borderRadius:4,cursor:historyLen>0?"pointer":"not-allowed",fontSize:11,flexShrink:0,whiteSpace:"nowrap"}}>↩ 取消{historyLen>0&&<span style={{marginLeft:4,background:"rgba(255,255,255,0.25)",borderRadius:8,padding:"0 5px",fontSize:10}}>{historyLen}</span>}</button>
+        <button onClick={redo} title="やり直す（Ctrl+Y）" onMouseEnter={e=>{e.currentTarget.title=redoTip();}} style={{background:"rgba(255,255,255,0.12)",border:"1px solid rgba(255,255,255,0.25)",color:"white",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:11,flexShrink:0,whiteSpace:"nowrap"}}>↪ やり直し</button>
         <div style={{width:1,height:18,background:"rgba(255,255,255,0.25)",flexShrink:0,margin:"0 2px"}}/>
 
         <HoverMenu icon="🔄" label="ビュー切り替え" items={[
@@ -4886,6 +5058,9 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
           classes={classes}
           teachers={teachers}
           executeChainSwap={executeChainSwap}
+          viewDate={dateMode?((datesRef.current||[])[selDi]||null):null}
+          onJumpDate={dt=>{const di=(datesRef.current||[]).indexOf(dt);if(di>=0)setSelDi(di);}}
+          canJumpDate={dt=>(datesRef.current||[]).includes(dt)}
           onClose={()=>setChainModal(null)}
         />
       )}
@@ -7665,7 +7840,7 @@ function UrlManageModal({classes,onClose}){
     const token=genToken();
     await sbSaveToken(token,type,classId);
     const longUrl=`${BASE_URL}?t=${token}`;
-    const shortUrl=await shortenUrl(longUrl);
+    const shortUrl=longUrl; // 【v8_7_35】外部短縮サービスへのトークン送信を廃止（shortenUrlは不使用化）
     const newRow={token,type,class_id:classId,short_url:shortUrl,created_at:new Date().toISOString()};
     setTokens(p=>[newRow,...p]);
     setGenerating(null);
@@ -8633,11 +8808,86 @@ function FillHoleModal({modal,classes,teachers,onExec,onClose}){
   );
 }
 
-function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainSwap,onClose}){
+// 【v8_7_38】3コマ回転の動きを、実際の時間割の上に矢印と薄い駒で見せる（候補にマウスを乗せている間だけ）
+function RotatePreviewOverlay({pieces,dateMode}){
+  const[geo,setGeo]=useState(null);
+  const colors=["#1D4ED8","#7C3AED","#065F46"];
+  useEffect(()=>{
+    let raf=0,last="",stop=false;
+    const findTd=(slot,entry)=>{
+      if(!slot||!entry)return null;
+      const tids=entry.teacherIds||[],cids=entry.classIds||[];
+      const tds=document.querySelectorAll("td[data-sp]");
+      for(const td of tds){
+        if(Number(td.getAttribute("data-sp"))!==Number(slot.period))continue;
+        const whenOk=dateMode?((td.getAttribute("data-sd")||"")===(slot.date||"")):((td.getAttribute("data-sday")||"")===(slot.day||""));
+        if(!whenOk)continue;
+        const stid=td.getAttribute("data-stid")||"",scid=td.getAttribute("data-scid")||"";
+        if((stid&&tids.includes(stid))||(scid&&cids.includes(scid)))return td;
+      }
+      return null;
+    };
+    const els=pieces.map(pc=>({from:findTd(pc.from,pc.entry),to:findTd(pc.to,pc.entry)}));
+    let frame=0;
+    const tick=()=>{
+      if(stop)return;
+      // 表示する日を切り替えた時など、枠が見つからない/消えた場合は少し間隔をあけて探し直す
+      if(++frame%10===0)els.forEach((o,i)=>{if(!o.from||!o.from.isConnected)o.from=findTd(pieces[i].from,pieces[i].entry);if(!o.to||!o.to.isConnected)o.to=findTd(pieces[i].to,pieces[i].entry);});
+      const g=els.map(o=>{
+        const r=el=>{if(!el||!el.isConnected)return null;const b=el.getBoundingClientRect();return{x:Math.round(b.left),y:Math.round(b.top),w:Math.round(b.width),h:Math.round(b.height)};};
+        return{from:r(o.from),to:r(o.to)};
+      });
+      const key=JSON.stringify(g);
+      if(key!==last){last=key;setGeo(g);}
+      raf=requestAnimationFrame(tick);
+    };
+    tick();
+    return()=>{stop=true;cancelAnimationFrame(raf);};
+  },[pieces,dateMode]);
+  if(!geo)return null;
+  const c=r=>({x:r.x+r.w/2,y:r.y+r.h/2});
+  const missing=[];
+  const parts=geo.map((g,i)=>{
+    const pc=pieces[i],col=colors[i%3],n="①②③"[i];
+    if(!g.to)missing.push(`${n}${pc.entry.subject||""}→${pc.toLabel||"別の場所"}`);
+    return(
+      <g key={i}>
+        {g.from&&<rect x={g.from.x+2} y={g.from.y+2} width={g.from.w-4} height={g.from.h-4} rx={6} fill={col+"22"} stroke={col} strokeWidth={3}/>}
+        {g.from&&<g><circle cx={g.from.x+14} cy={g.from.y+14} r={11} fill={col}/><text x={g.from.x+14} y={g.from.y+18.5} textAnchor="middle" fontSize={13} fontWeight={700} fill="white">{i+1}</text></g>}
+        {g.to&&<g>
+          <rect x={g.to.x+4} y={g.to.y+4} width={g.to.w-8} height={g.to.h-8} rx={6} fill="white" fillOpacity={0.82} stroke={col} strokeWidth={2.5} strokeDasharray="6 4"/>
+          <text x={g.to.x+g.to.w/2} y={g.to.y+g.to.h/2-2} textAnchor="middle" fontSize={13} fontWeight={700} fill={col}>{n}{pc.entry.subject||""}</text>
+          <text x={g.to.x+g.to.w/2} y={g.to.y+g.to.h/2+14} textAnchor="middle" fontSize={10} fill={col}>ここに移動</text>
+        </g>}
+        {g.from&&g.to&&(()=>{
+          const a=c(g.from),b=c(g.to);
+          const dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy)||1;
+          const ux=dx/len,uy=dy/len;
+          // 矢じりが行き先の枠の中に収まるよう少し手前で止める
+          const ex=b.x-ux*Math.min(g.to.w,g.to.h)*0.28,ey=b.y-uy*Math.min(g.to.w,g.to.h)*0.28;
+          const mx=(a.x+ex)/2-uy*Math.min(60,len*0.18),my=(a.y+ey)/2+ux*Math.min(60,len*0.18);
+          return<path d={`M${a.x},${a.y} Q${mx},${my} ${ex},${ey}`} fill="none" stroke={col} strokeWidth={3.5} strokeLinecap="round" markerEnd={`url(#rp-arrow-${i})`}/>;
+        })()}
+      </g>
+    );
+  });
+  return(
+    <>
+      <svg style={{position:"fixed",inset:0,width:"100vw",height:"100vh",pointerEvents:"none",zIndex:650}}>
+        <defs>{colors.map((col,i)=><marker key={i} id={`rp-arrow-${i}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill={col}/></marker>)}</defs>
+        {parts}
+      </svg>
+      {missing.length>0&&<div style={{position:"fixed",left:"50%",bottom:16,transform:"translateX(-50%)",zIndex:651,pointerEvents:"none",background:"#1E293B",color:"white",fontSize:12,padding:"6px 14px",borderRadius:8,maxWidth:"90vw"}}>画面に出ていない移動先：{missing.join(" ／ ")}</div>}
+    </>
+  );
+}
+
+function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainSwap,viewDate,onJumpDate,canJumpDate,onClose}){
   const{srcEntry,srcDc,tgtEntry,tgtDc,candidates,execDirect}=chainModal;
+  const[hov,setHov]=useState(null); // 【v8_7_38】マウスを乗せている候補の番号
   const cn=id=>classes.find(c=>c.id===id)?.name||id;
   const tn=id=>teachers.find(t=>t.id===id)?.name||id;
-  const DAYS7=["月","火","水","木","金","土","日"];
+  const DAYS7=["日","月","火","水","木","金","土"]; // getDay()用（日曜始まり）
 
   const slotLabel=(e,dc)=>{
     if(dateMode&&dc?.date){
@@ -8651,6 +8901,7 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
   // baseから対象エントリのdcを復元
   const getDc=(entry)=>{
     if(!entry)return null;
+    if(entry._chainDc)return{...entry._chainDc,matchCid:null,matchTid:null}; // 【v8_7_36】日付モードの候補は移動先(日付・時限)を持つ
     return{day:entry.day,period:entry.period,date:entry.date||null,matchCid:null,matchTid:null};
   };
 
@@ -8667,37 +8918,33 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
     </div>
   );
 
+  // 【v8_7_38】候補i番の「どの駒がどこへ動くか」。src→tgtの位置、tgt→cの位置、c→srcの位置
+  const rotCache=React.useRef({});
+  const rotPieces=(i)=>{
+    if(rotCache.current[i])return rotCache.current[i];
+    const cEntry=candidates[i],cDc=getDc(cEntry);
+    const v=[
+      {entry:srcEntry,from:srcDc,to:tgtDc,toLabel:slotLabel(tgtEntry,tgtDc)},
+      {entry:tgtEntry,from:tgtDc,to:cDc,toLabel:slotLabel(cEntry,cDc)},
+      {entry:cEntry,from:cDc,to:srcDc,toLabel:slotLabel(srcEntry,srcDc)},
+    ];
+    rotCache.current[i]=v;return v;
+  };
+
   return(
-    <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,0.65)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:500}} onClick={onClose}>
-      <div style={{background:"white",borderRadius:12,width:560,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",
+    <div style={{position:"fixed",inset:0,background:hov!=null?"rgba(15,23,42,0.12)":"rgba(15,23,42,0.65)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:500,transition:"background 0.15s"}} onClick={onClose}>
+      <div style={{background:"white",borderRadius:12,width:560,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",opacity:hov!=null?0.55:1,transition:"opacity 0.15s",
         boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}} onClick={e=>e.stopPropagation()}>
 
         {/* ヘッダー */}
         <div style={{padding:"16px 20px 12px",borderBottom:"1px solid #F1F5F9"}}>
-          <div style={{fontWeight:700,fontSize:16,color:"#1E3A5F"}}>🔄 交換の方法を選んでください</div>
+          <div style={{fontWeight:700,fontSize:16,color:"#1E3A5F"}}>🔄 3コマ回転を選んでください</div>
           <div style={{fontSize:11,color:"#94A3B8",marginTop:3}}>
-            ドロップ先に授業があります。直接交換するか、3コマ回転を選んでください。
+            1対1で入れ替えると重複するため、3コマ回転の候補から選んでください。
           </div>
         </div>
 
-        <div style={{padding:"16px 20px",display:"flex",flexDirection:"column",gap:12}}>
-
-          {/* 直接交換 */}
-          <div style={{border:"2px solid #E2E8F0",borderRadius:10,padding:"14px 16px"}}>
-            <div style={{fontSize:11,fontWeight:700,color:"#374151",marginBottom:10}}>⇄ 直接交換</div>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"center",flexWrap:"wrap",gap:4}}>
-              <EntryChip entry={srcEntry} slotLabel={slotLabel(srcEntry,srcDc)} color="#1D4ED8"/>
-              <Arrow/>
-              <EntryChip entry={tgtEntry} slotLabel={slotLabel(tgtEntry,tgtDc)} color="#7C3AED"/>
-            </div>
-            <div style={{display:"flex",justifyContent:"center",marginTop:12}}>
-              <button onClick={()=>{execDirect();onClose();}}
-                style={{padding:"9px 28px",background:"#1E3A5F",color:"white",border:"none",
-                  borderRadius:7,cursor:"pointer",fontSize:13,fontWeight:700}}>
-                ⇄ 直接交換で実行
-              </button>
-            </div>
-          </div>
+        <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:10}}>
 
           {/* 3コマ回転候補 */}
           {candidates.length>0&&(
@@ -8709,38 +8956,33 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
                 {candidates.map((cEntry,i)=>{
                   const cDc=getDc(cEntry);
                   return(
-                    <div key={cEntry.id} style={{border:"2px solid #E2E8F0",borderRadius:10,padding:"12px 14px",
+                    <div key={cEntry.id} onMouseEnter={()=>setHov(i)} onMouseLeave={()=>setHov(null)} onTouchStart={()=>setHov(i)}
+                      style={{border:hov===i?"2px solid #065F46":"2px solid #E2E8F0",borderRadius:10,padding:"8px 12px",
                       transition:"border-color 0.1s"}}>
-                      {/* 回転図 */}
-                      <div style={{display:"flex",alignItems:"center",justifyContent:"center",flexWrap:"wrap",gap:4,marginBottom:10}}>
-                        <EntryChip entry={srcEntry} slotLabel={slotLabel(srcEntry,srcDc)} color="#1D4ED8"/>
-                        <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
-                          <Arrow/>
-                          <div style={{fontSize:9,color:"#94A3B8",marginTop:-4}}>{slotLabel(tgtEntry,tgtDc)}</div>
+                      {/* 【v8_7_38】コンパクト表示：1候補＝3行（駒ごとの移動）＋実行ボタン。動きの全体は時間割上のプレビューで確認する */}
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",gap:3}}>
+                          {[[srcEntry,srcDc,tgtDc,"#1D4ED8"],[tgtEntry,tgtDc,cDc,"#7C3AED"],[cEntry,cDc,srcDc,"#065F46"]].map(([en,from,to,col],k)=>(
+                            <div key={k} style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"#334155",whiteSpace:"nowrap"}}>
+                              <span style={{background:col,color:"white",borderRadius:"50%",width:16,height:16,fontSize:10,fontWeight:700,display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{k+1}</span>
+                              <b style={{color:"#1E293B"}}>{en.subject}</b>
+                              <span style={{color:"#64748B",fontSize:11,overflow:"hidden",textOverflow:"ellipsis"}}>{(en.classIds||[]).map(c=>cn(c)).join("・")}</span>
+                              <span style={{color:"#94A3B8",fontSize:11}}>{slotLabel(en,from)}</span>
+                              <span style={{color:col,fontWeight:700}}>→</span>
+                              <span style={{color:col,fontSize:11,fontWeight:600}}>{slotLabel(en,to)}</span>
+                              {dateMode&&to?.date&&viewDate&&to.date!==viewDate&&canJumpDate&&canJumpDate(to.date)&&(
+                                <button onClick={e=>{e.stopPropagation();onJumpDate(to.date);}}
+                                  style={{marginLeft:2,padding:"1px 7px",fontSize:10,fontWeight:700,color:col,background:"white",border:`1px solid ${col}`,borderRadius:10,cursor:"pointer",whiteSpace:"nowrap"}}>
+                                  {(()=>{const d=new Date(to.date+"T00:00:00");return`${d.getMonth()+1}/${d.getDate()}（${DAYS7[d.getDay()]}）を見る`;})()}
+                                </button>
+                              )}
+                            </div>
+                          ))}
                         </div>
-                        <EntryChip entry={tgtEntry} slotLabel={slotLabel(tgtEntry,tgtDc)} color="#7C3AED"/>
-                        <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
-                          <Arrow/>
-                          <div style={{fontSize:9,color:"#94A3B8",marginTop:-4}}>{slotLabel(cEntry,cDc)}</div>
-                        </div>
-                        <EntryChip entry={cEntry} slotLabel={slotLabel(cEntry,cDc)} color="#065F46"/>
-                        <div style={{display:"flex",flexDirection:"column",alignItems:"center"}}>
-                          <Arrow/>
-                          <div style={{fontSize:9,color:"#94A3B8",marginTop:-4}}>{slotLabel(srcEntry,srcDc)}</div>
-                        </div>
-                      </div>
-                      {/* 説明テキスト */}
-                      <div style={{fontSize:11,color:"#475569",textAlign:"center",marginBottom:8}}>
-                        {srcEntry.subject}({slotLabel(srcEntry,srcDc)})
-                        → {tgtEntry.subject}の位置({slotLabel(tgtEntry,tgtDc)})へ、
-                        {tgtEntry.subject}→ {cEntry.subject}の位置({slotLabel(cEntry,cDc)})へ、
-                        {cEntry.subject}→ {srcEntry.subject}の位置({slotLabel(srcEntry,srcDc)})へ
-                      </div>
-                      <div style={{display:"flex",justifyContent:"center"}}>
                         <button onClick={()=>executeChainSwap(srcEntry,srcDc,tgtEntry,tgtDc,cEntry,cDc)}
-                          style={{padding:"8px 24px",background:"#065F46",color:"white",border:"none",
-                            borderRadius:7,cursor:"pointer",fontSize:13,fontWeight:700}}>
-                          🔄 この3コマ回転で実行
+                          style={{padding:"8px 14px",background:"#065F46",color:"white",border:"none",flexShrink:0,
+                            borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:700,whiteSpace:"nowrap"}}>
+                          🔄 実行
                         </button>
                       </div>
                     </div>
@@ -8760,6 +9002,7 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
           </button>
         </div>
       </div>
+      {hov!=null&&candidates[hov]&&<RotatePreviewOverlay dateMode={dateMode} pieces={rotPieces(hov)}/>}
     </div>
   );
 }
