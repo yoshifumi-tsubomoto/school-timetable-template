@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { createPortal } from "react-dom"; // 【v8_7_40】3コマ回転の動きプレビューを、表示倍率（zoom）の外に描くため
 // ── 学校ごとの設定（接続先・学校名）は src/config.js に分離 ─────────────────
 // 【v8_7_33】他校展開のため、接続先URL・キーの直書きをやめて config.js から読む。
 // 【v8_7_34】学校名も config.js から読むように変更（初期値。データベースに登録済みの
@@ -15,7 +16,9 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_39";
+const APP_VERSION="8_7_40";
+// 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
+const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
 // ── Supabase Auth クライアント（CDN動的ロード） ───────────────────────────────
 // パッケージ依存を増やさず、Google Identity Services と同じく CDN から読み込む。
@@ -880,6 +883,46 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
 
   // ── 3コマ回転候補ダイアログ ───────────────────────────────────────────────
   const[chainModal,setChainModal]=useState(null);
+  // ── 【v8_7_40】右パネル（重複解消・3コマ回転）が開いたら、時間割が切れないよう表示倍率を自動で下げる ──
+  //   開いて0.35秒後（右余白のアニメーション後）に時間割の表の大きさを測り、画面に収まる倍率（最小80%）にする。
+  //   80%でも入りきらない分は、時間割の横スクロールで見る（文字が小さすぎて読めなくなるのを防ぐ）。
+  //   閉じたら元の倍率に戻す。開いている間に利用者が倍率を変えた場合は、その倍率のままにする。
+  const sidePanelOpen=!!((conflictResolveModal&&!panelMinimized)||chainModal);
+  const autoZoomRef=useRef(null); // {prev, applied}
+  // 【v8_7_40】右パネルが開いている間は、左の「待機」欄をたたんで時間割の幅を広げる（ボタンで一時的に開ける）
+  const[benchPeek,setBenchPeek]=useState(false);
+  useEffect(()=>{if(!sidePanelOpen)setBenchPeek(false);},[sidePanelOpen]);
+  const benchFolded=sidePanelOpen&&!benchPeek;
+  useEffect(()=>{
+    if(!sidePanelOpen){
+      if(autoZoomRef.current){
+        const{prev,applied}=autoZoomRef.current;autoZoomRef.current=null;
+        setZoom(z=>z===applied?prev:z);
+      }
+      return;
+    }
+    if(autoZoomRef.current)return;
+    const t=setTimeout(()=>{
+      try{
+        const z0=zoom||1;
+        let right=0,bottom=0;
+        document.querySelectorAll("table").forEach(tb=>{
+          if(!tb.querySelector("td[data-sp]"))return;
+          const r=tb.getBoundingClientRect();
+          right=Math.max(right,r.right+window.scrollX);
+          bottom=Math.max(bottom,r.bottom+window.scrollY);
+        });
+        if(!right)return;
+        const needW=right/z0+408+8, needH=bottom/z0+8;   // 倍率1のときに必要な幅・高さ（右パネルの分を含む）
+        let fit=Math.min(window.innerWidth/needW,window.innerHeight/needH);
+        fit=Math.max(0.8,Math.floor(fit*20)/20);           // スライダーと同じ5%刻み・最小80%
+        if(fit>=z0)return;                                 // 収まっているなら変えない
+        autoZoomRef.current={prev:z0,applied:fit};
+        setZoom(fit);
+      }catch(_){}
+    },350);
+    return()=>clearTimeout(t);
+  },[sidePanelOpen]);
   // ── 玉突き提案ダイアログ（移動元の空き枠を同一クラス内のずらしで埋める）──
   const[fillHoleModal,setFillHoleModal]=useState(null);
   // ── ドラッグ中の3コマ候補ハイライト ──────────────────────────────────────
@@ -1618,6 +1661,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     const srcPeriod=srcCell.dc.period;
     const srcDay=dateMode?dowOf(srcCell.dc.date||""):srcCell.dc.day;
     const result={[srcHk]:{type:"src"}};
+    const rotViaCache=new Map(); // 【v8_7_40】(時限・日付)ごとの「重なる相手をどかす3コマ回転」の候補数（同じ枠は1回だけ探す）
     try{
       Object.entries(cellDataRef.current).forEach(([hk,cell])=>{
         if(hk===srcHk)return;
@@ -1687,7 +1731,21 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         if(conflictCids.length>0||unavailTids.length>0){
           // 重複相手エントリを特定（パルス表示用）
           const conflictEntries=othersInSlot.filter(e=>(e.classIds||[]).some(c=>conflictCids.includes(c))||(e.teacherIds||[]).some(t=>conflictTids.includes(t)));
-          result[hk]={type:"conflict",conflictClasses:conflictCids,unavailTids,conflictEntries};
+          // 【v8_7_40】学級だけが1つの授業(B)と重なる場合、「Bを別の枠へ、そこにあった駒を移動元へ」の3コマ回転で
+          //   解消できるなら紫(rotate)で示す。探索は3コマ回転と同じ computeChainCandidates（A→Bの枠、B→C、C→Aの元の枠）。
+          //   落としたときは、ドロップ処理の同じ判定で3コマ回転パネルが開く（空きセルのときだけ）。
+          let _viaCnt=0;
+          const _B=conflictEntries.length===1?conflictEntries[0]:null;
+          if(_B&&!tgt&&unavailTids.length===0&&conflictTids.length===0&&!_B.isBlocked&&!_B._removed&&computeChainRef.current){
+            const key=`${dc.date||dc.day}|${tgtPeriod}|${_B.id}`;
+            if(rotViaCache.has(key))_viaCnt=rotViaCache.get(key);
+            else{
+              try{_viaCnt=(computeChainRef.current(srcCell.entry,srcCell.dc,_B,{...dc,matchCid:null,matchTid:null})||[]).length;}catch(e){_viaCnt=0;}
+              rotViaCache.set(key,_viaCnt);
+            }
+          }
+          if(_viaCnt>0)result[hk]={type:"rotate",rotateSubject:_B.subject||"",rotateCount:_viaCnt,rotateVia:true,conflictEntries}; // conflictEntries は重なる相手の点滅用
+          else result[hk]={type:"conflict",conflictClasses:conflictCids,unavailTids,conflictEntries};
         }else{
           // 🔗 連動リンクの競合チェック（先生競合より優先：退かして移動できる場合を提案）
           const linkGroup=resolveLinkGroup(srcCell.entry);
@@ -2358,6 +2416,13 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   //   候補の移動先に日付も入らなかった（実行時に date=null の変更が作られてしまう）。
   //   ここでは「今週表示中の日付×時限」の実際の占有（occAt。重複解消の occAtV と同じ考え方）で探し、
   //   候補に移動先 _chainDc={day,period,date} を付ける。参照は ref とモジュール関数のみ（初回レンダー固定のクロージャでも最新値を読む）。
+  // 【v8_7_40】3つ目の駒(C)が動かす駒(A)と「同じ授業」（同じ教科・同じ学級・同じ先生）なら候補にしない。
+  //   C は A の元の位置へ入るので、A が抜けた所に同じ授業が戻るだけになり、回す意味がないため。
+  const sameLessonAs=(x,y)=>{
+    if(!x||!y||(x.subject||"")!==(y.subject||""))return false;
+    const xc=x.classIds||[],yc=y.classIds||[],xt=x.teacherIds||[],yt=y.teacherIds||[];
+    return xc.length===yc.length&&xc.every(c=>yc.includes(c))&&xt.length===yt.length&&xt.every(t=>yt.includes(t));
+  };
   const chainCandidatesDateFn=(srcEntry,srcDc,tgtEntry,tgtDc)=>{
     const sharedCids=(srcEntry.classIds||[]).filter(cid=>(tgtEntry?.classIds||[]).includes(cid));
     if(sharedCids.length===0)return[];
@@ -2414,6 +2479,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         for(const e of occAt(dt,pp)){
           if(out.length>=5)break;
           if(e.id===srcEntry.id||e.id===tgtEntry.id)continue;
+          if(sameLessonAs(e,srcEntry))continue; // 【v8_7_40】元の位置に同じ授業が戻るだけの案は除く
           if(!(e.classIds||[]).some(cid=>sharedCids.includes(cid)))continue;
           const involved=new Set([srcEntry.id,tgtEntry.id,e.id]);
           if(!fits(tgtEntry,dt,pp,involved))continue;                   // B → C の枠
@@ -2447,6 +2513,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     return baseSnap.filter(e=>{
       if(e.id===srcEntry.id||e.id===tgtEntry.id)return false;
       if(e.isBlocked||e._removed)return false;
+      if(sameLessonAs(e,srcEntry))return false; // 【v8_7_40】元の位置に同じ授業が戻るだけの案は除く
       if(!sharedCids.some(cid=>(e.classIds||[]).includes(cid)))return false;
       const slotKey=`${e.day}|${e.period}`;
       if(slotKey===srcSlotKey||slotKey===tgtSlotKey)return false;
@@ -2750,7 +2817,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         setHoverHk(h);
         // ホバー先がconflictなら重複相手のhkを特定してパルス表示
         const hDa=h?dragAnalysis?.[h]:null;
-        if(hDa?.type==="conflict"&&hDa.conflictEntries?.length>0){
+        if((hDa?.type==="conflict"||hDa?.rotateVia)&&hDa.conflictEntries?.length>0){ // 【v8_7_40】紫(どかす3コマ回転)でも重なる相手を点滅
           const conflictIds=new Set(hDa.conflictEntries.map(e=>e.id));
           const pulseHks=new Set(
             Object.entries(cellDataRef.current)
@@ -2941,6 +3008,19 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
                   .forEach(e=>{if(!conflictEntryIds.has(e.id)){conflictEntryIds.add(e.id);conflictItems.push({entry:e,type:'class',classId:cid});}});
               });
               conflictTeacherEntries.forEach(e=>{if(!conflictEntryIds.has(e.id)){conflictEntryIds.add(e.id);conflictItems.push({entry:e,type:'teacher'});}});
+              // 【v8_7_40】空きセルへの移動で、学級だけが1つの授業(B)と重なり、Bをどかす3コマ回転があるなら、
+              //   重複解消パネルではなく3コマ回転パネルを開く（ドラッグ中に紫で示したセルと同じ判定）。
+              if(!tgt.entry&&!hasTeacherConflict&&conflictItems.length===1&&conflictItems[0].type==='class'){
+                const _B=conflictItems[0].entry;
+                const _bDc={...tgt.dc,matchCid:null,matchTid:null};
+                let _rc=[];
+                try{_rc=computeChainCandidates.current(src.entry,src.dc,_B,_bDc)||[];}catch(_){_rc=[];}
+                if(_rc.length>0){
+                  setChainModal({srcEntry:src.entry,srcDc:src.dc,tgtEntry:_B,tgtDc:_bDc,candidates:_rc,via:true});
+                  setDragVisual(null);hoverHkRef.current=null;setHoverHk(null);
+                  return;
+                }
+              }
               // 各重複エントリの移動候補を生成（空きスロット）
               const currentTeachersSnap=teachersRef.current||[];
               const ALLD=dateModeRef.current?null:["月","火","水","木","金"];
@@ -3764,7 +3844,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             color:"white",borderRadius:6,padding:"5px 10px",fontSize:11,whiteSpace:"nowrap",
             zIndex:200,boxShadow:"0 4px 12px rgba(0,0,0,0.25)",pointerEvents:"none"}}>
             {da.type==="empty"&&"✓ ここへ移動（空きコマ）"}
-            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
+            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&(da.rotateVia?`🔄 ${da.rotateSubject}と重なります → ${da.rotateSubject}を別の枠へどかす3コマ回転で解決できます（${da.rotateCount}案・3コマ変更）`:`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`)}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
             {da.type==="conflict"&&(da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
             {da.type==="blocked"&&"🚫 空きコマには移動できません"}
             {da.type==="linkwarn"&&`🔗⚠ 連動中の「${da.linkNames}」の移動先も塞がっています → ドロップするとリンクが外れます`}{da.type==="linkswap"&&`🔗↩ ${da.blockerNames}を${da.srcDay}曜${da.srcPeriod}限に退かして連動移動できます`}
@@ -3967,7 +4047,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             color:"white",borderRadius:6,padding:"5px 10px",fontSize:11,whiteSpace:"nowrap",
             zIndex:200,boxShadow:"0 4px 12px rgba(0,0,0,0.25)",pointerEvents:"none"}}>
             {da.type==="empty"&&"✓ ここへ移動（空きコマ）"}
-            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
+            {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&(da.rotateVia?`🔄 ${da.rotateSubject}と重なります → ${da.rotateSubject}を別の枠へどかす3コマ回転で解決できます（${da.rotateCount}案・3コマ変更）`:`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`)}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
             {da.type==="conflict"&&(da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
             {da.type==="blocked"&&"🚫 空きコマには移動できません"}
             {da.type==="linkwarn"&&`🔗⚠ 連動中の「${da.linkNames}」の移動先も塞がっています → ドロップするとリンクが外れます`}{da.type==="linkswap"&&`🔗↩ ${da.blockerNames}を${da.srcDay}曜${da.srcPeriod}限に退かして連動移動できます`}
@@ -4173,7 +4253,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
 
   return(
     <div style={{minHeight:"100vh",background:"#F0F4F8",fontFamily:"'Noto Sans JP','Hiragino Sans',sans-serif",zoom:zoom,
-      marginRight:(conflictResolveModal&&!panelMinimized)?408:0,transition:"margin-right 0.3s cubic-bezier(0.4,0,0.2,1)"}}>
+      marginRight:((conflictResolveModal&&!panelMinimized)||chainModal)?408:0, /* 【v8_7_40】3コマ回転パネルも右に出すので同じ幅を空ける */transition:"margin-right 0.3s cubic-bezier(0.4,0,0.2,1)"}}>
 
 
       {/* ズームコントロール */}
@@ -4261,7 +4341,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
       <div style={{background:"#1E3A5F",color:"white",padding:"0 12px",display:"flex",alignItems:"center",height:46,gap:8,overflowX:"auto",scrollbarWidth:"none",flexShrink:0}}>
         <span style={{fontSize:18,flexShrink:0}}>📚</span>
         <span style={{fontWeight:700,fontSize:14,whiteSpace:"nowrap",flexShrink:0,letterSpacing:"0.02em"}}>{schoolName} 時間割</span>
-        <span style={{fontSize:10,fontWeight:600,color:"rgba(255,255,255,0.55)",whiteSpace:"nowrap",flexShrink:0,letterSpacing:"0.02em"}}>v{APP_VERSION}</span>
+        <span style={{fontSize:10,fontWeight:600,color:"rgba(255,255,255,0.55)",whiteSpace:"nowrap",flexShrink:0,letterSpacing:"0.02em"}} title={BUILD_TAG?`プレビュー：コミット ${BUILD_TAG}`:undefined}>v{APP_VERSION}{BUILD_TAG&&<span style={{marginLeft:4,padding:"0 4px",borderRadius:3,background:"rgba(255,255,255,0.18)",color:"rgba(255,255,255,0.85)",fontFamily:"monospace"}}>{BUILD_TAG}</span>}</span>
         {isDemo&&(
           <>
             <span style={{flexShrink:0,background:"#F59E0B",color:"#1E293B",fontWeight:800,fontSize:11,
@@ -4414,9 +4494,19 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
       <div style={{display:"flex",alignItems:"flex-start"}}>
 
         {/* 左サイドバー */}
-        <div style={{width:110,minWidth:110,flexShrink:0,background:"white",borderRight:"2px solid #E2E8F0",padding:"8px 6px"}}>
+        {/* 【v8_7_40】右パネルが開いている間はたたむ（幅110→26）。たたんだ帯を押すと一時的に開く */}
+        {benchFolded&&(
+          <button onClick={()=>setBenchPeek(true)} title="待機の欄を開く"
+            style={{width:26,minWidth:26,flexShrink:0,alignSelf:"stretch",background:"white",border:"none",borderRight:"2px solid #E2E8F0",
+              cursor:"pointer",padding:"10px 0",color:"#475569",fontSize:11,fontWeight:700,writingMode:"vertical-rl",letterSpacing:2}}>
+            ▶ 待機{bench.filter(Boolean).length>0?`（${bench.filter(Boolean).length}）`:""}
+          </button>
+        )}
+        <div style={{width:110,minWidth:110,flexShrink:0,background:"white",borderRight:"2px solid #E2E8F0",padding:"8px 6px",display:benchFolded?"none":undefined}}>
           <div style={{display:'flex',alignItems:'center',gap:4,marginBottom:6}}>
             <span style={{fontSize:11,fontWeight:700,color:'#475569'}}>🗂 待機</span>
+            {sidePanelOpen&&<button onClick={()=>setBenchPeek(false)} title="待機の欄をたたむ"
+              style={{fontSize:9,padding:'1px 4px',border:'1px solid #E2E8F0',borderRadius:3,cursor:'pointer',background:'#F8FAFC',color:'#64748B'}}>◀</button>}
             <button onClick={()=>setBench(Array(8).fill(null))}
               style={{marginLeft:'auto',fontSize:9,padding:'1px 5px',border:'1px solid #E2E8F0',borderRadius:3,cursor:'pointer',background:'#F8FAFC',color:'#64748B'}}>
               消去
@@ -5061,7 +5151,17 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
           viewDate={dateMode?((datesRef.current||[])[selDi]||null):null}
           onJumpDate={dt=>{const di=(datesRef.current||[]).indexOf(dt);if(di>=0)setSelDi(di);}}
           canJumpDate={dt=>(datesRef.current||[]).includes(dt)}
-          onClose={()=>setChainModal(null)}
+          viewDay={!dateMode&&view==="day"?DAYS[selDi]:null}
+          onFocusSlot={(slot,en)=>{
+            // 【v8_7_40】授業者別ビューで、その駒の先生を表示していなければ切り替える
+            if(view==="teacher"){const tids=en?.teacherIds||[];if(tids.length&&!tids.includes(selTch))setSelTch(tids[0]);}
+            // 1日ずつ表示の画面では、その日（曜日）へ切り替える（重複解消パネルの onFocusSlot と同じ）
+            if(dateMode){if(slot.date){const di=(datesRef.current||[]).indexOf(slot.date);if(di>=0)setSelDi(di);}}
+            else if(view==="day"&&slot.day){const di=DAYS.indexOf(slot.day);if(di>=0)setSelDi(di);}
+          }}
+          onJumpDay={d=>{const di=DAYS.indexOf(d);if(di>=0)setSelDi(di);}}
+          onPulseCells={cells=>setCandidateTargetPulse(cells&&cells.length?{cells}:null)}
+          onClose={()=>{setChainModal(null);setCandidateTargetPulse(null);}}
         />
       )}
       {/* ── 玉突き提案ダイアログ ── */}
@@ -8827,7 +8927,35 @@ function RotatePreviewOverlay({pieces,dateMode}){
       }
       return null;
     };
+    setGeo(null); // 【v8_7_40】候補を替えたら前の位置情報を捨てる（駒数が違うと描画で落ちていた）
     const els=pieces.map(pc=>({from:findTd(pc.from,pc.entry),to:findTd(pc.to,pc.entry)}));
+    // 【v8_7_40】動く駒が時間割の横スクロールの外にあるときは、見える位置まで自動で横スクロールする（候補に乗せた時に1回）
+    //   全部が入る幅なら全部が見える位置へ、入りきらないなら①の駒の元の位置を左端に合わせる。左は固定の「時限」列のぶん余白をとる。
+    try{
+      const tds=els.flatMap(o=>[o.from,o.to]).filter(Boolean);
+      let sc=tds[0]?.parentElement||null;
+      while(sc&&sc!==document.body){
+        const ox=getComputedStyle(sc).overflowX;
+        if((ox==="auto"||ox==="scroll")&&sc.scrollWidth>sc.clientWidth+1)break;
+        sc=sc.parentElement;
+      }
+      if(tds.length&&sc&&sc!==document.body){
+        const z=sc.currentCSSZoom||1;                       // 表示倍率（画面上の長さ → スクロール量への換算用）
+        const cr=sc.getBoundingClientRect();
+        const rs=tds.map(t=>t.getBoundingClientRect());
+        const L=Math.min(...rs.map(r=>r.left)),R=Math.max(...rs.map(r=>r.right));
+        const padL=90*z,padR=16*z;
+        let dx=0;
+        if(R-L<=cr.width-padL-padR){
+          if(L<cr.left+padL)dx=L-(cr.left+padL);
+          else if(R>cr.right-padR)dx=R-(cr.right-padR);
+        }else{
+          const f=(els[0].from||tds[0]).getBoundingClientRect();
+          dx=f.left-(cr.left+padL);
+        }
+        if(Math.abs(dx)>2)sc.scrollBy({left:dx/z,behavior:"smooth"});
+      }
+    }catch(_){}
     let frame=0;
     const tick=()=>{
       if(stop)return;
@@ -8844,11 +8972,11 @@ function RotatePreviewOverlay({pieces,dateMode}){
     tick();
     return()=>{stop=true;cancelAnimationFrame(raf);};
   },[pieces,dateMode]);
-  if(!geo)return null;
+  if(!geo||geo.length!==pieces.length)return null; // 【v8_7_40】駒数が合わない（切り替え直後）は描かない
   const c=r=>({x:r.x+r.w/2,y:r.y+r.h/2});
   const missing=[];
   const parts=geo.map((g,i)=>{
-    const pc=pieces[i],col=colors[i%3],n="①②③"[i];
+    const pc=pieces[i],col=colors[i%3],n="①②③④⑤⑥⑦⑧⑨"[i]||`(${i+1})`; // 【v8_7_40】玉突きの4駒以上にも対応
     if(!g.to)missing.push(`${n}${pc.entry.subject||""}→${pc.toLabel||"別の場所"}`);
     return(
       <g key={i}>
@@ -8871,20 +8999,37 @@ function RotatePreviewOverlay({pieces,dateMode}){
       </g>
     );
   });
-  return(
+  // 【v8_7_40】表示倍率（zoom）の内側に描くと位置がずれるため、document.body 直下に描く（座標は画面上の実際の位置）
+  return createPortal(
     <>
       <svg style={{position:"fixed",inset:0,width:"100vw",height:"100vh",pointerEvents:"none",zIndex:650}}>
         <defs>{colors.map((col,i)=><marker key={i} id={`rp-arrow-${i}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill={col}/></marker>)}</defs>
         {parts}
       </svg>
       {missing.length>0&&<div style={{position:"fixed",left:"50%",bottom:16,transform:"translateX(-50%)",zIndex:651,pointerEvents:"none",background:"#1E293B",color:"white",fontSize:12,padding:"6px 14px",borderRadius:8,maxWidth:"90vw"}}>画面に出ていない移動先：{missing.join(" ／ ")}</div>}
-    </>
+    </>,
+    document.body
   );
 }
 
-function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainSwap,viewDate,onJumpDate,canJumpDate,onClose}){
-  const{srcEntry,srcDc,tgtEntry,tgtDc,candidates,execDirect}=chainModal;
+function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainSwap,viewDate,onJumpDate,canJumpDate,viewDay,onJumpDay,onFocusSlot,onPulseCells,onClose}){
+  const{srcEntry,srcDc,tgtEntry,tgtDc,candidates,execDirect,via}=chainModal; // via: 空きセルで重なる授業(tgtEntry)をどかす形【v8_7_40】
   const[hov,setHov]=useState(null); // 【v8_7_38】マウスを乗せている候補の番号
+  // 【v8_7_40】「〇曜〇限」の文字に乗せると、そのセルを点滅（重複解消パネルと同じ仕組み）。閉じたら必ず消す
+  useEffect(()=>()=>{onPulseCells&&onPulseCells(null);},[]);
+  // 【v8_7_40】見えていない先生・曜日・日付への切り替えは、文字の上で0.3秒止めたときだけ（通り過ぎただけでは切り替えない）
+  const focusTimerRef=React.useRef(null);
+  useEffect(()=>()=>clearTimeout(focusTimerRef.current),[]);
+  const leaveSlot=()=>{clearTimeout(focusTimerRef.current);onPulseCells&&onPulseCells(null);};
+  const pulseSlot=(en,slot,kind)=>{
+    clearTimeout(focusTimerRef.current);
+    if(!slot)return;
+    const day=slot.day||(slot.date?["日","月","火","水","木","金","土"][new Date(slot.date+"T00:00:00").getDay()]:undefined);
+    const spec={date:slot.date||null,day,period:slot.period,tids:en.teacherIds||[],cids:en.classIds||[],kind};
+    if(onPulseCells)onPulseCells([spec]);
+    // 切り替えたあとに出てきたセルにも点滅を当て直す（同じ指定を新しく渡して点滅を再適用させる）
+    if(onFocusSlot)focusTimerRef.current=setTimeout(()=>{onFocusSlot(slot,en);onPulseCells&&onPulseCells([{...spec}]);},300);
+  };
   const cn=id=>classes.find(c=>c.id===id)?.name||id;
   const tn=id=>teachers.find(t=>t.id===id)?.name||id;
   const DAYS7=["日","月","火","水","木","金","土"]; // getDay()用（日曜始まり）
@@ -8894,6 +9039,9 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
       const d=new Date(dc.date+"T00:00:00");
       return`${d.getMonth()+1}/${d.getDate()}（${DAYS7[d.getDay()]}）${dc.period}限`;
     }
+    // 【v8_7_40】移動先(dc)の曜日・時限を優先する。以前は駒の今の位置(e.day)を優先していたため、
+    //   基本時間割では行き先も元の位置と同じ表記（例：月曜5限→月曜5限）になっていた。
+    if(dc?.day&&dc?.period)return`${dc.day}曜${dc.period}限`;
     if(e?.day)return`${e.day}曜${e.period}限`;
     return`${dc?.day||"?"}曜${dc?.period||"?"}限`;
   };
@@ -8932,19 +9080,24 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
   };
 
   return(
-    <div style={{position:"fixed",inset:0,background:hov!=null?"rgba(15,23,42,0.12)":"rgba(15,23,42,0.65)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:500,transition:"background 0.15s"}} onClick={onClose}>
-      <div style={{background:"white",borderRadius:12,width:560,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",opacity:hov!=null?0.55:1,transition:"opacity 0.15s",
-        boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}} onClick={e=>e.stopPropagation()}>
+    <>
+      {/* 【v8_7_40】中央のダイアログをやめ、重複解消パネルと同じく右側のパネルにした（時間割に重ならない。本体は右に408px空ける） */}
+      <div style={{position:"fixed",top:0,right:0,bottom:0,width:400,maxWidth:"92vw",background:"white",
+        boxShadow:"-8px 0 40px rgba(0,0,0,0.18)",zIndex:599,display:"flex",flexDirection:"column",overflow:"hidden"}}>
 
         {/* ヘッダー */}
-        <div style={{padding:"16px 20px 12px",borderBottom:"1px solid #F1F5F9"}}>
-          <div style={{fontWeight:700,fontSize:16,color:"#1E3A5F"}}>🔄 3コマ回転を選んでください</div>
-          <div style={{fontSize:11,color:"#94A3B8",marginTop:3}}>
-            1対1で入れ替えると重複するため、3コマ回転の候補から選んでください。
+        <div style={{padding:"16px 18px 12px",background:"#7C3AED12",borderBottom:"1px solid #7C3AED30",flexShrink:0,display:"flex",alignItems:"flex-start",gap:8}}>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:800,fontSize:15,color:"#5B21B6"}}>🔄 3コマ回転を選んでください</div>
+            <div style={{fontSize:11,color:"#64748B",marginTop:4,lineHeight:1.5}}>
+              {via?`${tgtEntry?.subject||""}と重なるため、${tgtEntry?.subject||""}を別の枠へどかす3コマ回転の候補から選んでください。`:"1対1で入れ替えると重複するため、3コマ回転の候補から選んでください。"}候補にマウスを乗せると、左の時間割に動きが表示されます。
+            </div>
           </div>
+          <button onClick={onClose} title="閉じる（キャンセル）"
+            style={{background:"none",border:"none",cursor:"pointer",fontSize:18,color:"#94A3B8",lineHeight:1,padding:2,flexShrink:0}}>✕</button>
         </div>
 
-        <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:10}}>
+        <div style={{padding:"12px 14px",display:"flex",flexDirection:"column",gap:10,flex:1,overflowY:"auto"}}>
 
           {/* 3コマ回転候補 */}
           {candidates.length>0&&(
@@ -8956,33 +9109,55 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
                 {candidates.map((cEntry,i)=>{
                   const cDc=getDc(cEntry);
                   return(
-                    <div key={cEntry.id} onMouseEnter={()=>setHov(i)} onMouseLeave={()=>setHov(null)} onTouchStart={()=>setHov(i)}
+                    <div key={cEntry.id} onMouseEnter={()=>setHov(i)} onMouseMove={()=>{if(hov!==i)setHov(i);}} onMouseLeave={()=>setHov(null)} onTouchStart={()=>setHov(i)}
                       style={{border:hov===i?"2px solid #065F46":"2px solid #E2E8F0",borderRadius:10,padding:"8px 12px",
                       transition:"border-color 0.1s"}}>
                       {/* 【v8_7_38】コンパクト表示：1候補＝3行（駒ごとの移動）＋実行ボタン。動きの全体は時間割上のプレビューで確認する */}
-                      <div style={{display:"flex",alignItems:"center",gap:10}}>
-                        <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",gap:3}}>
+                      {/* 【v8_7_40】右パネル（幅400）に収まるよう、行は折り返し可・実行ボタンは下に置く */}
+                      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                        <div style={{minWidth:0,display:"flex",flexDirection:"column",gap:4}}>
                           {[[srcEntry,srcDc,tgtDc,"#1D4ED8"],[tgtEntry,tgtDc,cDc,"#7C3AED"],[cEntry,cDc,srcDc,"#065F46"]].map(([en,from,to,col],k)=>(
-                            <div key={k} style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"#334155",whiteSpace:"nowrap"}}>
+                            <div key={k} style={{display:"flex",alignItems:"center",flexWrap:"wrap",columnGap:6,rowGap:2,fontSize:12,color:"#334155",whiteSpace:"nowrap"}}>
                               <span style={{background:col,color:"white",borderRadius:"50%",width:16,height:16,fontSize:10,fontWeight:700,display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{k+1}</span>
                               <b style={{color:"#1E293B"}}>{en.subject}</b>
                               <span style={{color:"#64748B",fontSize:11,overflow:"hidden",textOverflow:"ellipsis"}}>{(en.classIds||[]).map(c=>cn(c)).join("・")}</span>
-                              <span style={{color:"#94A3B8",fontSize:11}}>{slotLabel(en,from)}</span>
+                              <span style={{color:"#94A3B8",fontSize:11,cursor:"help",textDecoration:"underline dotted",textUnderlineOffset:2}}
+                                onMouseEnter={()=>pulseSlot(en,from,'from')} onMouseLeave={leaveSlot}>{slotLabel(en,from)}</span>
                               <span style={{color:col,fontWeight:700}}>→</span>
-                              <span style={{color:col,fontSize:11,fontWeight:600}}>{slotLabel(en,to)}</span>
-                              {dateMode&&to?.date&&viewDate&&to.date!==viewDate&&canJumpDate&&canJumpDate(to.date)&&(
-                                <button onClick={e=>{e.stopPropagation();onJumpDate(to.date);}}
-                                  style={{marginLeft:2,padding:"1px 7px",fontSize:10,fontWeight:700,color:col,background:"white",border:`1px solid ${col}`,borderRadius:10,cursor:"pointer",whiteSpace:"nowrap"}}>
-                                  {(()=>{const d=new Date(to.date+"T00:00:00");return`${d.getMonth()+1}/${d.getDate()}（${DAYS7[d.getDay()]}）を見る`;})()}
-                                </button>
-                              )}
+                              <span style={{color:col,fontSize:11,fontWeight:600,cursor:"help",textDecoration:"underline dotted",textUnderlineOffset:2}}
+                                onMouseEnter={()=>pulseSlot(en,to,'to')} onMouseLeave={leaveSlot}>{slotLabel(en,to)}</span>
+                              {(()=>{
+                                // 【v8_7_40】行き先（それが見えていれば元の位置）が、表示中の日・曜日と違えば「〜を見る」ボタンを出す。
+                                //   週間日課変更は日付で、基本時間割の授業者一覧（1日ずつ表示）は曜日で切り替える。
+                                const bst={marginLeft:2,padding:"1px 7px",fontSize:10,fontWeight:700,color:col,background:"white",border:`1px solid ${col}`,borderRadius:10,cursor:"pointer",whiteSpace:"nowrap"};
+                                // 【v8_7_40】ボタンが要らない時も同じ大きさの見えない場所を取っておく。表示する日・曜日を切り替えたときに
+                                //   ボタンが出たり消えたりして候補の高さが変わると、マウスの下の候補がずれて、乗せていた候補が外れてしまうため。
+                                const ghost=lbl=><span aria-hidden="true" style={{...bst,visibility:"hidden",cursor:"default"}}>{lbl}</span>;
+                                if(dateMode){
+                                  if(!viewDate)return null;
+                                  const pk=[to,from].find(sl=>sl?.date&&sl.date!==viewDate&&canJumpDate&&canJumpDate(sl.date));
+                                  const ref=pk||to||from;
+                                  if(!ref?.date)return null;
+                                  const d=new Date(ref.date+"T00:00:00");
+                                  const lbl=`${d.getMonth()+1}/${d.getDate()}（${DAYS7[d.getDay()]}）を見る`;
+                                  if(!pk)return ghost(lbl);
+                                  return<button onClick={e=>{e.stopPropagation();onJumpDate(pk.date);}} style={bst}>{lbl}</button>;
+                                }
+                                if(!viewDay||!onJumpDay)return null;
+                                const pk=[to,from].find(sl=>sl?.day&&sl.day!==viewDay);
+                                const ref=pk||to||from;
+                                if(!ref?.day)return null;
+                                const lbl=`${ref.day}曜を見る`;
+                                if(!pk)return ghost(lbl);
+                                return<button onClick={e=>{e.stopPropagation();onJumpDay(pk.day);}} style={bst}>{lbl}</button>;
+                              })()}
                             </div>
                           ))}
                         </div>
                         <button onClick={()=>executeChainSwap(srcEntry,srcDc,tgtEntry,tgtDc,cEntry,cDc)}
-                          style={{padding:"8px 14px",background:"#065F46",color:"white",border:"none",flexShrink:0,
+                          style={{alignSelf:"flex-end",padding:"7px 16px",background:"#065F46",color:"white",border:"none",flexShrink:0,
                             borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:700,whiteSpace:"nowrap"}}>
-                          🔄 実行
+                          🔄 この案で実行
                         </button>
                       </div>
                     </div>
@@ -8994,7 +9169,7 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
         </div>
 
         {/* フッター */}
-        <div style={{padding:"12px 20px",borderTop:"1px solid #F1F5F9",display:"flex",justifyContent:"flex-end"}}>
+        <div style={{padding:"12px 18px",borderTop:"1px solid #F1F5F9",display:"flex",justifyContent:"flex-end",flexShrink:0}}>
           <button onClick={onClose}
             style={{padding:"9px 20px",background:"#F1F5F9",color:"#64748B",border:"none",
               borderRadius:7,cursor:"pointer",fontSize:13,fontWeight:700}}>
@@ -9003,7 +9178,7 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
         </div>
       </div>
       {hov!=null&&candidates[hov]&&<RotatePreviewOverlay dateMode={dateMode} pieces={rotPieces(hov)}/>}
-    </div>
+    </>
   );
 }
 
@@ -9702,6 +9877,8 @@ function AdminManagerModal({currentEmail,onClose}){
 // ドロップ後に右からスライドインするトライアルパネル
 // ステップ: select（候補選択） → preview（適用済み確認中） → done（確定済み）
 function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMinimizeChange}){
+  // 【v8_7_40】候補にマウスを乗せている間、動く駒の番号と矢印を時間割の上に描く（3コマ回転と同じ RotatePreviewOverlay）
+  const[arrowPieces,setArrowPieces]=React.useState(null);
   const{srcEntry,srcDc,tgtDc,hasClassConflict,hasTeacherConflict,conflictItems,
         onForce,onMoveConflict,onPreviewConflict,onPreviewChainConflict,onConfirmAfterPreview,
         onResolveConflictOnly,onResolveChainOnly,onPlaceMain,onApplyResolved,
@@ -9802,6 +9979,16 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
     period:slot.period,
     tids:e.teacherIds||[],cids:e.classIds||[],kind,
   });
+  // 【v8_7_40】矢印表示用：動く駒ごとに {entry,from,to}。曜日が無いスロットは日付から補う
+  const normSlot=s=>s?{...s,day:s.day||(s.date?jpDow(s.date):tgtDc.day)}:s;
+  const pieceOf=(e,from,to)=>({entry:e,from:normSlot(from),to:normSlot(to),toLabel:slotLabel(to)});
+  const buildArrowPieces=(item,toSlot,steps)=>{
+    const ps=[];
+    if(srcEntry)ps.push(pieceOf(srcEntry,srcDc,tgtDc));
+    ps.push(pieceOf(item.entry,tgtDc,toSlot));
+    (steps||[]).forEach(st=>ps.push(pieceOf(st.entry,st.from,st.to)));
+    return ps;
+  };
   // この連鎖手で動く全駒の出発/到着セルを列挙（主役＋重複相手＋玉突き各手）
   const buildChainCells=(item,cc)=>{
     const cells=[];
@@ -9989,8 +10176,8 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
                       style={{padding:'6px 12px',background:fills?'#FEF3C7':'#F0FDF4',border:`1.5px solid ${fills?'#F59E0B':'#86EFAC'}`,
                         borderRadius:6,fontSize:12,cursor:'pointer',color:fills?'#B45309':'#15803D',fontWeight:fills?800:600,
                         transition:'all 0.12s'}}
-                      onMouseEnter={e=>{e.target.style.transform='translateY(-1px)';onHoverCandidate&&onHoverCandidate(item,slot);}}
-                      onMouseLeave={e=>{e.target.style.transform='none';onLeaveCandidate&&onLeaveCandidate();}}>
+                      onMouseEnter={e=>{e.target.style.transform='translateY(-1px)';onHoverCandidate&&onHoverCandidate(item,slot);setArrowPieces(buildArrowPieces(item,slot));}}
+                      onMouseLeave={e=>{e.target.style.transform='none';onLeaveCandidate&&onLeaveCandidate();setArrowPieces(null);}}>
                       {fills?'★ ':'▶ '}{slotLabel(slot)}
                     </button>
                     );
@@ -10022,8 +10209,8 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
                       style={{padding:'7px 10px',background:clean?'#F0FDF4':'#FFFBEB',border:`1.5px solid ${clean?'#86EFAC':'#FCD34D'}`,
                         borderRadius:6,fontSize:11,cursor:'pointer',color:clean?'#15803D':'#92400E',fontWeight:600,
                         textAlign:'left',lineHeight:1.5,transition:'all 0.12s'}}
-                      onMouseEnter={e=>{e.currentTarget.style.background=clean?'#DCFCE7':'#FEF3C7';onPulseCells&&onPulseCells(fullCells);}}
-                      onMouseLeave={e=>{e.currentTarget.style.background=clean?'#F0FDF4':'#FFFBEB';onPulseCells&&onPulseCells(null);}}>
+                      onMouseEnter={e=>{e.currentTarget.style.background=clean?'#DCFCE7':'#FEF3C7';onPulseCells&&onPulseCells(fullCells);setArrowPieces(buildArrowPieces(item,cc.slot,cc.steps));}}
+                      onMouseLeave={e=>{e.currentTarget.style.background=clean?'#F0FDF4':'#FFFBEB';onPulseCells&&onPulseCells(null);setArrowPieces(null);}}>
                       {clean
                         ? <div style={{color:'#15803D',fontWeight:800,marginBottom:3}}>★ 完全に解消（空き・重複なし）</div>
                         : <div style={{color:'#B45309',fontWeight:800,marginBottom:3}}>⚠ 次の副作用が出ます{v&&v.holes.length>0?`：${v.holes.join('・')}に空きができます`:''}{v&&v.teacherConflicts.length>0?`／${v.teacherConflicts.join('・')}先生が重複します`:''}{v&&v.classConflicts.length>0?`／${v.classConflicts.join('・')}が重複します`:''}</div>}
@@ -10161,6 +10348,7 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
           pointerEvents:'none',
         }}
       />
+      {arrowPieces&&step==='select'&&!minimized&&<RotatePreviewOverlay dateMode={dateMode} pieces={arrowPieces}/>}
       {/* たたみ中の再表示ボタン */}
       {minimized&&(
         <button onClick={()=>setMinimized(false)}
