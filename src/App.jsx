@@ -16,7 +16,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_40";
+const APP_VERSION="8_7_41";
 // 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
 const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
@@ -1721,6 +1721,10 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         const conflictTids=srcTidsArr.filter(tid=>
           othersInSlot.some(e=>(e.teacherIds||[]).includes(tid))
         );
+        // 【v8_7_41】会議：動かす駒の先生が、落とす先の時間（曜日×時限）に会議に出ていれば重複（赤）。
+        //   これまでは授業の重なりしか見ておらず、会議の時間でも緑・黄になり、落とすと会議と重なっていた。
+        //   判定は画面の重複検出（授業↔会議）と同じ「曜日×時限」。
+        const meetingTids=srcTidsArr.filter(tid=>meetings.some(m=>m.day===tgtDay&&m.period===tgtPeriod&&(m.teacherIds||[]).includes(tid)));
         // 先生の不在・非常勤チェック（avail設定）
         const unavailTids=srcTidsArr.filter(tid=>{
           const t=teachers.find(x=>x.id===tid);
@@ -1728,7 +1732,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         });
 
         // クラス競合・不在は最優先（先生競合より前）
-        if(conflictCids.length>0||unavailTids.length>0){
+        if(conflictCids.length>0||unavailTids.length>0||meetingTids.length>0){
           // 重複相手エントリを特定（パルス表示用）
           const conflictEntries=othersInSlot.filter(e=>(e.classIds||[]).some(c=>conflictCids.includes(c))||(e.teacherIds||[]).some(t=>conflictTids.includes(t)));
           // 【v8_7_40】学級だけが1つの授業(B)と重なる場合、「Bを別の枠へ、そこにあった駒を移動元へ」の3コマ回転で
@@ -1736,7 +1740,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
           //   落としたときは、ドロップ処理の同じ判定で3コマ回転パネルが開く（空きセルのときだけ）。
           let _viaCnt=0;
           const _B=conflictEntries.length===1?conflictEntries[0]:null;
-          if(_B&&!tgt&&unavailTids.length===0&&conflictTids.length===0&&!_B.isBlocked&&!_B._removed&&computeChainRef.current){
+          if(_B&&!tgt&&unavailTids.length===0&&conflictTids.length===0&&meetingTids.length===0&&!_B.isBlocked&&!_B._removed&&computeChainRef.current){
             const key=`${dc.date||dc.day}|${tgtPeriod}|${_B.id}`;
             if(rotViaCache.has(key))_viaCnt=rotViaCache.get(key);
             else{
@@ -1745,7 +1749,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             }
           }
           if(_viaCnt>0)result[hk]={type:"rotate",rotateSubject:_B.subject||"",rotateCount:_viaCnt,rotateVia:true,conflictEntries}; // conflictEntries は重なる相手の点滅用
-          else result[hk]={type:"conflict",conflictClasses:conflictCids,unavailTids,conflictEntries};
+          else result[hk]={type:"conflict",conflictClasses:conflictCids,unavailTids,meetingTids,conflictEntries};
         }else{
           // 🔗 連動リンクの競合チェック（先生競合より優先：退かして移動できる場合を提案）
           const linkGroup=resolveLinkGroup(srcCell.entry);
@@ -1835,13 +1839,15 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             const swapClassConflict=srcOccupants.filter(e=>(e.classIds||[]).some(cid=>tgtCidsArr.includes(cid))).flatMap(e=>(e.classIds||[]).filter(cid=>tgtCidsArr.includes(cid)));
             const swapTeacherConflict=srcOccupants.some(e=>(e.teacherIds||[]).some(tid=>tgtTidsArr.includes(tid)));
             const swapTchUnavail=tgtTidsArr.some(tid=>{const t=teachers.find(x=>x.id===tid);return t&&!isSlotAvailable(t,srcDay,srcPeriod,srcDate,teacherDateOverrides);});
-            if(swapClassConflict.length>0||swapTeacherConflict||swapTchUnavail){
+            // 【v8_7_41】押し出される駒の先生が、移動元の時間に会議に出ていれば、1対1の入れ替えはできない
+            const swapMeeting=tgtTidsArr.some(tid=>meetings.some(m=>m.day===srcDay&&m.period===srcPeriod&&(m.teacherIds||[]).includes(tid)));
+            if(swapClassConflict.length>0||swapTeacherConflict||swapTchUnavail||swapMeeting){
               // 入れ替えると移動元で重複が出る → 通常は重複として表示。
               // 【v8_7_36】ただし重複の理由が移動元の学級/先生の重なりで、3コマ回転の候補があるなら紫(rotate)で示す。
               //   （変更コマ数の少ない順：空きへ移動1 ＜ 1対1入替2(黄) ＜ 3コマ回転3(紫)。1対1が成立するセルは従来どおり黄のまま）
               //   ドロップ時の判定（directSwapConflicts＋computeChainCandidates）と同じ条件に揃えている。
               let _rotCands=[];
-              if((swapClassConflict.length>0||swapTeacherConflict)&&!tgt._removed&&computeChainRef.current
+              if((swapClassConflict.length>0||swapTeacherConflict||swapMeeting)&&!tgt._removed&&computeChainRef.current
                 &&(srcCell.entry.classIds||[]).some(c=>tgtCidsArr.includes(c))){
                 try{_rotCands=computeChainRef.current(srcCell.entry,srcCell.dc,tgt,dc)||[];}catch(e){_rotCands=[];}
               }
@@ -2919,6 +2925,27 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             const tgtIsSwap=tgt.entry&&!tgt.entry.isBlocked&&!tgt.entry._removed&&!tgtSharesTeacher;
             // moveExec へ渡すスワップ相手（同一先生のときは null＝入れ替えしない）
             const tgtForMove=tgtIsSwap?tgt.entry:null;
+            // 【v8_7_41】会議と重なるなら、動かす前に確認する（ドラッグ中の赤表示と同じ判定：曜日×時限）。
+            //   ①動かす駒の先生が、落とす先の時間に会議 ②入れ替えで押し出される駒の先生が、移動元の時間に会議
+            {
+              const mtgs=saveRef.current?.meetings||[];
+              const dowAt=dc=>dateModeRef.current?dowOf(dc?.date||""):dc?.day;
+              const tName=id=>(teachersRef.current||[]).find(t=>t.id===id)?.name||id;
+              const hits=[];
+              const chk=(entry,dc)=>{
+                if(!dc?.period)return;
+                (entry?.teacherIds||[]).forEach(tid=>{
+                  const m=mtgs.find(m=>m.day===dowAt(dc)&&m.period===dc.period&&(m.teacherIds||[]).includes(tid));
+                  if(m)hits.push(`・${tName(tid)}先生：${m.day}曜${m.period}限は「${m.name||"会議"}」`);
+                });
+              };
+              chk(src.entry,tgt.dc);
+              if(tgtForMove)chk(tgtForMove,src.dc);
+              if(hits.length&&!window.confirm(`会議と重なります。\n${hits.join("\n")}\n\nこのまま動かしますか？（「キャンセル」で動かさずに戻します）`)){
+                setDragVisual(null);hoverHkRef.current=null;setHoverHk(null);
+                return;
+              }
+            }
             const sharedWithTgt=tgtIsSwap?srcCidsList.filter(cid=>(tgt.entry.classIds||[]).includes(cid)):[];
             // 移動先の他の先生のセルで、同じクラスを担当しているものを検出
             const conflictTeachers=[];
@@ -3845,7 +3872,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             zIndex:200,boxShadow:"0 4px 12px rgba(0,0,0,0.25)",pointerEvents:"none"}}>
             {da.type==="empty"&&"✓ ここへ移動（空きコマ）"}
             {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&(da.rotateVia?`🔄 ${da.rotateSubject}と重なります → ${da.rotateSubject}を別の枠へどかす3コマ回転で解決できます（${da.rotateCount}案・3コマ変更）`:`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`)}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
-            {da.type==="conflict"&&(da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
+            {da.type==="conflict"&&(da.meetingTids?.length>0?`📋 ${da.meetingTids.map(tid=>tn(tid)).join("・")}先生はこの時限に会議があります`:da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
             {da.type==="blocked"&&"🚫 空きコマには移動できません"}
             {da.type==="linkwarn"&&`🔗⚠ 連動中の「${da.linkNames}」の移動先も塞がっています → ドロップするとリンクが外れます`}{da.type==="linkswap"&&`🔗↩ ${da.blockerNames}を${da.srcDay}曜${da.srcPeriod}限に退かして連動移動できます`}
           </div>
@@ -4048,7 +4075,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             zIndex:200,boxShadow:"0 4px 12px rgba(0,0,0,0.25)",pointerEvents:"none"}}>
             {da.type==="empty"&&"✓ ここへ移動（空きコマ）"}
             {da.type==="swap"&&`⇄ ${da.swapSubject}（${(da.swapClasses||[]).map(c=>cn(c)).join("・")}）と入れ替え（2コマ変更）`}{da.type==="rotate"&&(da.rotateVia?`🔄 ${da.rotateSubject}と重なります → ${da.rotateSubject}を別の枠へどかす3コマ回転で解決できます（${da.rotateCount}案・3コマ変更）`:`🔄 ${da.rotateSubject}と1対1で入れ替えると重複します → 3コマ回転なら解決できます（${da.rotateCount}案・3コマ変更）`)}{da.type==="chain"&&`🔄 ${da.chainSubject} と3コマ回転候補`}
-            {da.type==="conflict"&&(da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
+            {da.type==="conflict"&&(da.meetingTids?.length>0?`📋 ${da.meetingTids.map(tid=>tn(tid)).join("・")}先生はこの時限に会議があります`:da.unavailTids?.length>0?`🚫 ${da.unavailTids.map(tid=>tn(tid)).join("・")}先生はこの時限に不在です`:da.conflictClasses?.length>0?`⚠ ${da.conflictClasses.map(c=>cn(c)).join("・")}が重複します`:"⚠ 先生が重複します")}
             {da.type==="blocked"&&"🚫 空きコマには移動できません"}
             {da.type==="linkwarn"&&`🔗⚠ 連動中の「${da.linkNames}」の移動先も塞がっています → ドロップするとリンクが外れます`}{da.type==="linkswap"&&`🔗↩ ${da.blockerNames}を${da.srcDay}曜${da.srcPeriod}限に退かして連動移動できます`}
           </div>
