@@ -16,7 +16,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_41";
+const APP_VERSION="8_7_43";
 // 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
 const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
@@ -449,6 +449,9 @@ if(typeof document!=="undefined"&&!document.getElementById("conflict-pulse-style
     td.candidate-target-pulse::before { animation: candPulseFade 0.7s ease-in-out infinite; box-shadow: inset 0 0 0 4px #16A34A; background: rgba(22,163,74,0.22); }
     td.candidate-from-pulse::before   { animation: candPulseFade 0.7s ease-in-out infinite; box-shadow: inset 0 0 0 4px #D97706; background: rgba(217,119,6,0.24); }
     td.candidate-both-pulse::before   { animation: candPulseFade 0.7s ease-in-out infinite; box-shadow: inset 0 0 0 4px #2563EB; background: rgba(37,99,235,0.24); }
+    /* 【v8_7_43】「〇曜〇限」に乗せて点滅させている間は、動きのプレビュー（番号・矢印・薄い駒）を薄くして、点滅を見えるようにする */
+    .rp-overlay { transition: opacity 0.15s; }
+    body[data-slot-pulse="1"] .rp-overlay { opacity: 0.12; }
     /* 【v8_7_24】ホバー用の直接ハイライト（状態を更新せずDOMで当てる。再描画が起きず点滅が安定する） */
     td.hover-target-pulse { position: relative; }
     td.hover-target-pulse::before { content:""; position:absolute; inset:0; pointer-events:none; z-index:9; border-radius:2px; animation: candPulseFade 0.7s ease-in-out infinite; box-shadow: inset 0 0 0 4px #16A34A; background: rgba(22,163,74,0.22); }
@@ -597,6 +600,44 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const[conflictPulseHks,setConflictPulseHks]=useState(new Set()); // パルス表示する重複相手hk
   // トライアルパネルで候補ホバー時に移動先セルを点滅させるターゲット {date,day,period,tids:[],cids:[]}
   const[candidateTargetPulse,setCandidateTargetPulse]=useState(null);
+  // ── 【v8_7_42】「〇曜〇限」（SlotLink）用：その駒が見える画面への切り替えと点滅 ──
+  //   ref 経由なので、useEffect([]) 内のクロージャ（重複解消パネルなど）から呼んでも最新の表示状態で動く。
+  const viewRef=useRef(view);viewRef.current=view;
+  const selTchRef=useRef(selTch);selTchRef.current=selTch;
+  const selClsRef=useRef(selCls);selClsRef.current=selCls;
+  const focusSlotViewRef=useRef(null);
+  focusSlotViewRef.current=(slot,en)=>{
+    if(!slot)return;
+    const v=viewRef.current;
+    if(v==="teacher"){const tids=en?.teacherIds||[];if(tids.length&&!tids.includes(selTchRef.current))setSelTch(tids[0]);}
+    if(v==="class"){const cids=en?.classIds||[];if(cids.length&&!cids.includes(selClsRef.current))setSelCls(cids[0]);}
+    if(dateModeRef.current){if(slot.date){const di=(datesRef.current||[]).indexOf(slot.date);if(di>=0)setSelDi(di);}}
+    else if(v==="day"&&slot.day){const di=DAYS.indexOf(slot.day);if(di>=0)setSelDi(di);}
+  };
+  const slotHoverTimerRef=useRef(null);
+  const slotApiRef=useRef(null);
+  if(!slotApiRef.current){
+    const specOf=(slot,en,kind)=>({date:slot.date||null,day:slot.day||(slot.date?"日月火水木金土"[new Date(slot.date+"T00:00:00").getDay()]:undefined),
+      period:slot.period,tids:en?.teacherIds||[],cids:en?.classIds||[],kind});
+    const pulse=cells=>setCandidateTargetPulse(cells&&cells.length?{cells}:null);
+    slotApiRef.current={
+      pulse,
+      hover:(slot,en,kind)=>{
+        clearTimeout(slotHoverTimerRef.current);if(!slot)return;
+        try{document.body.setAttribute("data-slot-pulse","1");}catch(_){} // 【v8_7_43】点滅中は動きのプレビューを薄く
+        pulse([specOf(slot,en,kind)]);
+        // 切り替えたあとに出てきたセルにも点滅を当て直す（新しい指定を渡して再適用）
+        slotHoverTimerRef.current=setTimeout(()=>{focusSlotViewRef.current&&focusSlotViewRef.current(slot,en);pulse([specOf(slot,en,kind)]);},300);
+      },
+      leave:(restore)=>{clearTimeout(slotHoverTimerRef.current);pulse(restore||null);try{document.body.removeAttribute("data-slot-pulse");}catch(_){}},
+      click:(slot,en,kind)=>{
+        clearTimeout(slotHoverTimerRef.current);if(!slot)return;
+        try{document.body.setAttribute("data-slot-pulse","1");}catch(_){}
+        focusSlotViewRef.current&&focusSlotViewRef.current(slot,en);pulse([specOf(slot,en,kind)]);
+      },
+    };
+  }
+  const slotApi=slotApiRef.current;
   // candidateTargetPulse に応じて該当セル(td)へ candidate-target-pulse クラスを直接付与
   // （MultiCell/CellTD はインライン定義で再マウントするため、render後にDOMで確実に当てる）
   useEffect(()=>{
@@ -1865,6 +1906,27 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     }catch(e){console.error("dragAnalysis error",e);}
     return result;
   },[dragVisual,base,changes,teachers,chainVersion]);
+  // 【v8_7_43】ドラッグ中、置けるセルに「必要な変更の数」（空き1・入れ替え2・3コマ回転3）を数字で出し、
+  //   表示中の画面でいちばん少ない行き先に★を付ける（1が最少のときは、緑がそのまま答えなので★は付けない）。
+  const dragCost=da=>da?(da.type==="empty"?1:da.type==="swap"?2:da.type==="rotate"?3:null):null;
+  const dragMin=(()=>{
+    if(!dragVisual||!dragAnalysis)return null;
+    const pre=view==="class"?"cv":view==="teacher"?"tv":"dv"; // 今の画面のセルだけで比べる
+    let m=null;
+    Object.entries(dragAnalysis).forEach(([hk,da])=>{if(!hk.startsWith(pre))return;const c=dragCost(da);if(c!=null&&(m==null||c<m))m=c;});
+    return m;
+  })();
+  const CostBadge=({da})=>{
+    const c=dragCost(da);
+    if(c==null)return null;
+    return(
+      <div style={{position:"absolute",top:2,right:2,zIndex:7,display:"flex",alignItems:"center",gap:2,pointerEvents:"none"}}>
+        {c===dragMin&&dragMin>1&&<span style={{fontSize:13,color:"#F59E0B",lineHeight:1}}>★</span>}
+        <span style={{width:18,height:18,borderRadius:"50%",color:"white",fontSize:11,fontWeight:800,display:"inline-flex",alignItems:"center",justifyContent:"center",
+          background:c===1?"#16A34A":c===2?"#CA8A04":"#7C3AED"}}>{c}</span>
+      </div>
+    );
+  };
 
   const unplacedLessons=useMemo(()=>{
     const result=[];
@@ -2335,8 +2397,10 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   };
 
   // 【v8_7_37】from→to の変化（=行った操作）を日本語で説明する。取消/やり直しのボタン説明・通知に使う。
-  const describeOp=(from,to)=>{
-    if(!from||!to)return"変更";
+  // 【v8_7_42】asSeg=true のときは、通知用に「文字列と {slot,entry,kind} の並び」を返す（「〇曜〇限」を乗せて点滅できるように）
+  const describeOp=(from,to,asSeg=false)=>{
+    if(!from||!to)return asSeg?["変更"]:"変更";
+    const SL=(e,kind)=>({slot:e.date?{date:e.date,period:e.period}:{day:e.day,period:e.period},entry:e,kind});
     const cn=nameRef.current.classes||[];
     const lab=e=>`${e.subject||"授業"}${(e.classIds||[]).length?"（"+(e.classIds||[]).map(c=>cn.find(x=>x.id===c)?.name||c).join("・")+"）":""}`;
     const bslot=e=>e.day&&e.period?`${e.day}${e.period}限`:"待機";
@@ -2349,10 +2413,15 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     const bd=diffList(from.base,to.base);
     const moved=bd.both.filter(([a,b])=>a.day!==b.day||a.period!==b.period);
     const edited=bd.both.filter(([a,b])=>(a.day===b.day&&a.period===b.period)&&JSON.stringify(a)!==JSON.stringify(b));
+    const okSlot=e=>e.day&&e.period; // 待機（day無し）は「待機」の文字のまま
     if(moved.length===2&&bslot(moved[0][0])===bslot(moved[1][1])&&bslot(moved[0][1])===bslot(moved[1][0]))
-      parts.push(`${lab(moved[0][1])}と${lab(moved[1][1])}の入れ替え（${bslot(moved[0][0])}⇄${bslot(moved[1][0])}）`);
+      parts.push(asSeg&&okSlot(moved[0][0])&&okSlot(moved[1][0])
+        ?[`${lab(moved[0][1])}と${lab(moved[1][1])}の入れ替え（`,SL(moved[0][0],'from'),"⇄",SL(moved[1][0],'from'),"）"]
+        :`${lab(moved[0][1])}と${lab(moved[1][1])}の入れ替え（${bslot(moved[0][0])}⇄${bslot(moved[1][0])}）`);
     else if(moved.length===3)parts.push(`3コマ回転（${moved.map(([,b])=>lab(b)).join("・")}）`);
-    else if(moved.length===1)parts.push(`${lab(moved[0][1])}を${bslot(moved[0][0])}から${bslot(moved[0][1])}へ移動`);
+    else if(moved.length===1)parts.push(asSeg
+      ?[`${lab(moved[0][1])}を`,okSlot(moved[0][0])?SL(moved[0][0],'from'):"待機","から",okSlot(moved[0][1])?SL(moved[0][1],'to'):"待機","へ移動"]
+      :`${lab(moved[0][1])}を${bslot(moved[0][0])}から${bslot(moved[0][1])}へ移動`);
     else if(moved.length>1)parts.push(`${moved.length}コマの移動`);
     if(bd.added.length)parts.push(bd.added.length===1?`${lab(bd.added[0])}の追加`:`${bd.added.length}コマの追加`);
     if(bd.removed.length)parts.push(bd.removed.length===1?`${lab(bd.removed[0])}の削除`:`${bd.removed.length}コマの削除`);
@@ -2365,12 +2434,21 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     if(cAddL.length){
       const rot=cAddL.some(c=>String(c.note||"").includes("3コマ回転"))||cAddL.length===3;
       const dt=cAddL[0].date?`（${dslot(cAddL[0])}ほか）`:"";
+      if(asSeg&&cAddL[0].date){
+        const head=rot?"日付つきの3コマ回転":cAddL.length===2?"日付つきの入れ替え":cAddL.length===1?`日付つき変更：${lab(cAddL[0])}`:`日付つき変更${cAddL.length}件`;
+        parts.push([`${head}（`,SL(cAddL[0],'to'),cAddL.length>1?"ほか）":"）"]);
+      }else
       parts.push(rot?`日付つきの3コマ回転${dt}`:cAddL.length===2?`日付つきの入れ替え${dt}`:cAddL.length===1?`日付つき変更：${lab(cAddL[0])}（${dslot(cAddL[0])}）`:`日付つき変更${cAddL.length}件の追加`);
     }else if(cAddR.length)parts.push(`日付つきの授業の取り除き${cAddR.length}件`);
     if(cDel.length)parts.push(`日付つき変更${cDel.length}件の取消`);
     if(cEd.length&&!cAddL.length)parts.push(`日付つき変更${cEd.length}件の修正`);
     if(JSON.stringify(from.dayPatterns)!==JSON.stringify(to.dayPatterns))parts.push("日課パターンの変更");
-    return parts.length?parts.join("／"):"変更";
+    if(asSeg){
+      if(!parts.length)return["変更"];
+      const out=[];parts.forEach((pt,i)=>{if(i)out.push("／");if(Array.isArray(pt))out.push(...pt);else out.push(pt);});
+      return out;
+    }
+    return parts.length?parts.map(pt=>Array.isArray(pt)?pt.map(sg=>typeof sg==="string"?sg:fmtSlot(sg.slot)).join(""):pt).join("／"):"変更";
   };
   // 次に取り消す／やり直す操作の説明
   const undoTip=()=>{const h=historyRef.current;if(!h.length)return"取り消せる操作はありません（Ctrl+Z）";return`元に戻す（Ctrl+Z）\n戻す操作：${describeOp(h[h.length-1],currentRef.current)}`;};
@@ -2379,7 +2457,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const undo=()=>{
     if(historyRef.current.length===0){showMoveNotice('↩ これ以上取り消せません',[]);return;}
     const prev=historyRef.current[historyRef.current.length-1];
-    showMoveNotice('↩ 取り消しました',[describeOp(prev,currentRef.current)]);
+    showMoveNotice('↩ 取り消しました',[describeOp(prev,currentRef.current,true)]);
     historyRef.current=historyRef.current.slice(0,-1);
     redoRef.current=[...redoRef.current,JSON.parse(JSON.stringify(currentRef.current))];
     skipHistoryRef.current=true; // undo/redoはuseEffectの自動履歴保存をスキップ
@@ -2391,7 +2469,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const redo=()=>{
     if(redoRef.current.length===0){showMoveNotice('↪ やり直せる操作はありません',[]);return;}
     const next=redoRef.current[redoRef.current.length-1];
-    showMoveNotice('↪ やり直しました',[describeOp(currentRef.current,next)]);
+    showMoveNotice('↪ やり直しました',[describeOp(currentRef.current,next,true)]);
     redoRef.current=redoRef.current.slice(0,-1);
     historyRef.current=[...historyRef.current,JSON.parse(JSON.stringify(currentRef.current))];
     skipHistoryRef.current=true; // undo/redoはuseEffectの自動履歴保存をスキップ
@@ -2553,13 +2631,25 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
       {
         const _cn=id=>classes.find(c=>c.id===id)?.name||id;
         const lbl=e=>`${e.subject}（${(e.classIds||[]).map(_cn).join('・')}）`;
+        const sl=dc=>({day:dc.day,period:dc.period});
         showMoveNotice('🔄 3コマ回転で移動しました',[
-          `1. ${lbl(srcEntry)}${srcDc.day}曜${srcDc.period}限 → ${tgtDc.day}曜${tgtDc.period}限`,
-          `2. ${lbl(tgtEntry)}${tgtDc.day}曜${tgtDc.period}限 → ${cDc.day}曜${cDc.period}限`,
-          `3. ${lbl(cEntry)}${cDc.day}曜${cDc.period}限 → ${srcDc.day}曜${srcDc.period}限`,
+          [`1. ${lbl(srcEntry)}`,{slot:sl(srcDc),entry:srcEntry,kind:'from'},' → ',{slot:sl(tgtDc),entry:srcEntry,kind:'to'}],
+          [`2. ${lbl(tgtEntry)}`,{slot:sl(tgtDc),entry:tgtEntry,kind:'from'},' → ',{slot:sl(cDc),entry:tgtEntry,kind:'to'}],
+          [`3. ${lbl(cEntry)}`,{slot:sl(cDc),entry:cEntry,kind:'from'},' → ',{slot:sl(srcDc),entry:cEntry,kind:'to'}],
         ]);
       }
     }else{
+      // 【v8_7_42】週間日課変更でも、何を動かしたかを通知する（日付つき。「〇/〇（曜）〇限」は乗せると点滅）
+      {
+        const _cn=id=>classes.find(c=>c.id===id)?.name||id;
+        const lbl=e=>`${e.subject}（${(e.classIds||[]).map(_cn).join('・')}）`;
+        const sl=dc=>({date:dc.date,period:dc.period});
+        showMoveNotice('🔄 3コマ回転で移動しました',[
+          [`1. ${lbl(srcEntry)}`,{slot:sl(srcDc),entry:srcEntry,kind:'from'},' → ',{slot:sl(tgtDc),entry:srcEntry,kind:'to'}],
+          [`2. ${lbl(tgtEntry)}`,{slot:sl(tgtDc),entry:tgtEntry,kind:'from'},' → ',{slot:sl(cDc),entry:tgtEntry,kind:'to'}],
+          [`3. ${lbl(cEntry)}`,{slot:sl(cDc),entry:cEntry,kind:'from'},' → ',{slot:sl(srcDc),entry:cEntry,kind:'to'}],
+        ]);
+      }
       const srcCids=new Set(srcEntry.classIds||[]);
       const tgtCids=new Set(tgtEntry.classIds||[]);
       const cCids  =new Set(cEntry.classIds||[]);
@@ -2749,8 +2839,9 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     {
       const _cn=id=>classes.find(c=>c.id===id)?.name||id;
       const _tn=id=>teachers.find(t=>t.id===id)?.name||"";
-      const lines=chain.steps.map((s,i)=>
-        `${i+1}. ${s.kind==='displace'?'↪どかす ':''}${s.entry.subject}（${(s.entry.classIds||[]).map(_cn).join('・')}・${(s.entry.teacherIds||[]).map(_tn).filter(Boolean).join('・')}先生）${s.from.day}曜${s.from.period}限 → ${s.to.day}曜${s.to.period}限`);
+      const lines=chain.steps.map((s,i)=>[
+        `${i+1}. ${s.kind==='displace'?'↪どかす ':''}${s.entry.subject}（${(s.entry.classIds||[]).map(_cn).join('・')}・${(s.entry.teacherIds||[]).map(_tn).filter(Boolean).join('・')}先生）`,
+        {slot:{day:s.from.day,period:s.from.period},entry:s.entry,kind:'from'},' → ',{slot:{day:s.to.day,period:s.to.period},entry:s.entry,kind:'to'}]);
       showMoveNotice('🧩 玉突きで移動しました',lines);
     }
     setFillHoleModal(null);
@@ -3587,13 +3678,9 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
                 onPulseCells:(cells)=>setCandidateTargetPulse(cells&&cells.length?{cells}:null),
                 // トライアルパネル用: スロット表記ホバー時に、その日のタブへ自動で切り替える
                 // （授業者一覧／週間は1日ずつ表示のため、別日の駒を点滅させるには表示日を合わせる必要がある）
-                onFocusSlot:(slot)=>{
+                onFocusSlot:(slot,en)=>{ // 【v8_7_42】共通の表示切り替え（先生・学級・曜日・日）
                   if(!slot)return;
-                  if(dateModeRef.current){
-                    if(slot.date){const di=(datesRef.current||[]).indexOf(slot.date);if(di>=0)setSelDi(di);}
-                  }else{
-                    if(slot.day){const di=DAYS.indexOf(slot.day);if(di>=0)setSelDi(di);}
-                  }
+                  focusSlotViewRef.current&&focusSlotViewRef.current(slot,en);
                 },
               });
               // 常時ハイライト情報をセット: 移動元 / 移動先(主役) / 重複相手の現在地
@@ -3859,6 +3946,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         {isLastEdited&&!isDragging&&<div style={{position:"absolute",top:2,left:2,fontSize:9,color:"#6366F1",fontWeight:700,zIndex:5,lineHeight:1}}>✎</div>}
         {conflict&&!isDragging&&<div title="重複しています" style={{position:"absolute",top:2,right:2,fontSize:10,fontWeight:800,color:"#DC2626",zIndex:6,lineHeight:1,background:"rgba(255,255,255,0.9)",borderRadius:3,padding:"1px 2px"}}>⚠</div>}
         <div style={{padding:"4px 5px",height:"100%",boxSizing:"border-box",position:"relative"}}>
+        {isDragging&&<CostBadge da={da}/>}
         {isDragging&&da&&da.type!=="src"&&(
           <div style={{fontSize:9,fontWeight:700,marginBottom:1,
             color:da.type==="conflict"?"#DC2626":da.type==="empty"?"#16A34A":da.type==="swap"?"#92400E":da.type==="rotate"?"#5B21B6":da.type==="chain"?"#6D28D9":da.type==="linkwarn"?"#B45309":da.type==="linkswap"?"#0E7490":"#9CA3AF"}}>
@@ -4062,6 +4150,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         {isLastEdited&&!isDragging&&<div style={{position:"absolute",top:2,left:2,fontSize:9,color:"#6366F1",fontWeight:700,zIndex:5,lineHeight:1}}>✎</div>}
         {conflict&&!isDragging&&<div title="重複しています" style={{position:"absolute",top:2,right:2,fontSize:10,fontWeight:800,color:"#DC2626",zIndex:6,lineHeight:1,background:"rgba(255,255,255,0.9)",borderRadius:3,padding:"1px 2px"}}>⚠</div>}
         <div style={{padding:"4px 5px",height:"100%",boxSizing:"border-box",position:"relative"}}>
+        {isDragging&&<CostBadge da={da}/>}
         {isDragging&&da&&da.type!=="src"&&(
           <div style={{fontSize:9,fontWeight:700,marginBottom:1,
             color:da.type==="conflict"?"#DC2626":da.type==="empty"?"#16A34A":da.type==="swap"?"#92400E":da.type==="rotate"?"#5B21B6":da.type==="chain"?"#6D28D9":da.type==="linkwarn"?"#B45309":da.type==="linkswap"?"#0E7490":"#9CA3AF"}}>
@@ -4349,6 +4438,8 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
       {/* ── 移動サマリー通知（複数コマの移動内容）── */}
       {moveNotice&&(
         <div onClick={()=>{clearTimeout(moveNoticeTimerRef.current);setMoveNotice(null);}}
+          onMouseEnter={()=>clearTimeout(moveNoticeTimerRef.current)} /* 【v8_7_42】乗せている間は消さない */
+          onMouseLeave={()=>{clearTimeout(moveNoticeTimerRef.current);moveNoticeTimerRef.current=setTimeout(()=>setMoveNotice(null),4000);}}
           style={{position:"fixed",bottom:80,left:"50%",transform:"translateX(-50%)",
           background:"#ECFDF5",border:"1.5px solid #A7F3D0",
           borderRadius:10,padding:"12px 20px",fontSize:12,
@@ -4359,7 +4450,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
             <span style={{fontSize:10,color:"#6EE7B7",fontWeight:600}}>（クリックで閉じる）</span>
           </div>
           {moveNotice.lines.map((ln,i)=>(
-            <div key={i} style={{fontWeight:600,lineHeight:1.7,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{ln}</div>
+            <div key={i} style={{fontWeight:600,lineHeight:1.7,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}><SlotLine line={ln} api={slotApi}/></div>
           ))}
         </div>
       )}
@@ -5128,6 +5219,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
           classes={classes}
           teachers={teachers}
           dateMode={dateMode}
+          slotApi={slotApi}
           onMinimizeChange={setPanelMinimized}
           onClose={()=>{setConflictResolveModal(null);setCandidateTargetPulse(null);trialHiRef.current=null;setPanelMinimized(false);}}
           onUndo={()=>{
@@ -5179,15 +5271,8 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
           onJumpDate={dt=>{const di=(datesRef.current||[]).indexOf(dt);if(di>=0)setSelDi(di);}}
           canJumpDate={dt=>(datesRef.current||[]).includes(dt)}
           viewDay={!dateMode&&view==="day"?DAYS[selDi]:null}
-          onFocusSlot={(slot,en)=>{
-            // 【v8_7_40】授業者別ビューで、その駒の先生を表示していなければ切り替える
-            if(view==="teacher"){const tids=en?.teacherIds||[];if(tids.length&&!tids.includes(selTch))setSelTch(tids[0]);}
-            // 1日ずつ表示の画面では、その日（曜日）へ切り替える（重複解消パネルの onFocusSlot と同じ）
-            if(dateMode){if(slot.date){const di=(datesRef.current||[]).indexOf(slot.date);if(di>=0)setSelDi(di);}}
-            else if(view==="day"&&slot.day){const di=DAYS.indexOf(slot.day);if(di>=0)setSelDi(di);}
-          }}
           onJumpDay={d=>{const di=DAYS.indexOf(d);if(di>=0)setSelDi(di);}}
-          onPulseCells={cells=>setCandidateTargetPulse(cells&&cells.length?{cells}:null)}
+          slotApi={slotApi}
           onClose={()=>{setChainModal(null);setCandidateTargetPulse(null);}}
         />
       )}
@@ -5197,6 +5282,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
           modal={fillHoleModal}
           classes={classes}
           teachers={teachers}
+          slotApi={slotApi}
           onExec={executeFillHoleChain}
           onClose={()=>setFillHoleModal(null)}
         />
@@ -8817,7 +8903,7 @@ function MeetingModal({meetings,setMeetings,teachers,onClose}){
 // ── ChainSwapModal ────────────────────────────────────────────────────────────
 // ── 玉突き提案モーダル ──────────────────────────────────────────────────────
 // 移動元の空き枠を、同一クラスの授業をずらして埋める連鎖（1〜3手）を提案する
-function FillHoleModal({modal,classes,teachers,onExec,onClose}){
+function FillHoleModal({modal,classes,teachers,slotApi,onExec,onClose}){
   const{srcEntry,srcDc,tgtDc,chains}=modal;
   // モーダルをたたんで後ろの時間割を確認するモード
   const[minimized,setMinimized]=React.useState(false);
@@ -8842,9 +8928,9 @@ function FillHoleModal({modal,classes,teachers,onExec,onClose}){
       <span style={{fontSize:12,color:"#1E293B"}}>
         <b>{step.entry.subject}</b>
         <span style={{color:"#64748B",fontSize:11}}>（{(step.entry.classIds||[]).map(cn).join("・")}・{(step.entry.teacherIds||[]).map(tn).join("・")}先生）</span>
-        　{slotL(step.from)}
+        　<SlotLink slot={step.from} entry={step.entry} kind="from" api={slotApi} label={slotL(step.from)}/>
         <span style={{color:"#94A3B8",margin:"0 4px"}}>→</span>
-        <b style={{color:step.kind==='displace'?"#B45309":"#065F46"}}>{slotL(step.to)}</b>
+        <SlotLink slot={step.to} entry={step.entry} kind="to" api={slotApi} label={slotL(step.to)} style={{fontWeight:700,color:step.kind==='displace'?"#B45309":"#065F46"}}/>
       </span>
     </div>
   );
@@ -8936,22 +9022,53 @@ function FillHoleModal({modal,classes,teachers,onExec,onClose}){
 }
 
 // 【v8_7_38】3コマ回転の動きを、実際の時間割の上に矢印と薄い駒で見せる（候補にマウスを乗せている間だけ）
+// ── 【v8_7_42】「〇曜〇限」の共通部品 ─────────────────────────────────────────
+//   乗せる→そのセルを点滅。0.3秒止める、またはクリック→画面に出ていなければ、その先生・曜日・日へ表示を切り替えて点滅。
+//   タイマーと切り替えは App の slotApi が持つ（パネル内でこの部品が作り直されても、待ち時間が途切れない）。
+function fmtSlot(slot){
+  if(!slot)return"";
+  if(slot.date){const d=new Date(slot.date+"T00:00:00");return`${d.getMonth()+1}/${d.getDate()}（${"日月火水木金土"[d.getDay()]}）${slot.period}限`;}
+  return`${slot.day||"?"}曜${slot.period||"?"}限`;
+}
+function SlotLink({slot,entry,kind="to",api,label,restore,style}){
+  if(!slot)return null;
+  const text=label!=null?label:fmtSlot(slot);
+  if(!api)return<span style={style}>{text}</span>;
+  return(
+    <span onMouseEnter={()=>api.hover(slot,entry,kind)} onMouseLeave={()=>api.leave(restore)}
+      onClick={e=>{e.stopPropagation();api.click(slot,entry,kind);}}
+      title="乗せると点滅します（0.3秒止めるかクリックすると、その場所を表示）"
+      style={{cursor:"pointer",textDecoration:"underline dotted",textUnderlineOffset:2,...style}}>{text}</span>
+  );
+}
+// 通知などの1行：文字列、または「文字列と {slot,entry,kind} の並び」
+function SlotLine({line,api}){
+  if(!Array.isArray(line))return<>{line}</>;
+  return<>{line.map((sg,j)=>typeof sg==="string"?<React.Fragment key={j}>{sg}</React.Fragment>:<SlotLink key={j} {...sg} api={api}/>)}</>;
+}
+
 function RotatePreviewOverlay({pieces,dateMode}){
   const[geo,setGeo]=useState(null);
   const colors=["#1D4ED8","#7C3AED","#065F46"];
   useEffect(()=>{
     let raf=0,last="",stop=false;
+    // 【v8_7_42】先生・学級が一致するセルが無いとき（授業者別ビューで別の先生の駒、学級別ビューで別の学級の駒）は、
+    //   その時限のセルが画面に1つだけなら、そのセルを「時間の位置」として使う（＝別の先生・学級の授業として描く）。
+    const otherEls=new WeakSet();
     const findTd=(slot,entry)=>{
       if(!slot||!entry)return null;
       const tids=entry.teacherIds||[],cids=entry.classIds||[];
       const tds=document.querySelectorAll("td[data-sp]");
+      const sameSlot=[];
       for(const td of tds){
         if(Number(td.getAttribute("data-sp"))!==Number(slot.period))continue;
         const whenOk=dateMode?((td.getAttribute("data-sd")||"")===(slot.date||"")):((td.getAttribute("data-sday")||"")===(slot.day||""));
         if(!whenOk)continue;
+        sameSlot.push(td);
         const stid=td.getAttribute("data-stid")||"",scid=td.getAttribute("data-scid")||"";
         if((stid&&tids.includes(stid))||(scid&&cids.includes(scid)))return td;
       }
+      if(sameSlot.length===1){otherEls.add(sameSlot[0]);return sameSlot[0];}
       return null;
     };
     setGeo(null); // 【v8_7_40】候補を替えたら前の位置情報を捨てる（駒数が違うと描画で落ちていた）
@@ -8989,7 +9106,7 @@ function RotatePreviewOverlay({pieces,dateMode}){
       // 表示する日を切り替えた時など、枠が見つからない/消えた場合は少し間隔をあけて探し直す
       if(++frame%10===0)els.forEach((o,i)=>{if(!o.from||!o.from.isConnected)o.from=findTd(pieces[i].from,pieces[i].entry);if(!o.to||!o.to.isConnected)o.to=findTd(pieces[i].to,pieces[i].entry);});
       const g=els.map(o=>{
-        const r=el=>{if(!el||!el.isConnected)return null;const b=el.getBoundingClientRect();return{x:Math.round(b.left),y:Math.round(b.top),w:Math.round(b.width),h:Math.round(b.height)};};
+        const r=el=>{if(!el||!el.isConnected)return null;const b=el.getBoundingClientRect();return{x:Math.round(b.left),y:Math.round(b.top),w:Math.round(b.width),h:Math.round(b.height),other:otherEls.has(el)};};
         return{from:r(o.from),to:r(o.to)};
       });
       const key=JSON.stringify(g);
@@ -9012,7 +9129,7 @@ function RotatePreviewOverlay({pieces,dateMode}){
         {g.to&&<g>
           <rect x={g.to.x+4} y={g.to.y+4} width={g.to.w-8} height={g.to.h-8} rx={6} fill="white" fillOpacity={0.82} stroke={col} strokeWidth={2.5} strokeDasharray="6 4"/>
           <text x={g.to.x+g.to.w/2} y={g.to.y+g.to.h/2-2} textAnchor="middle" fontSize={13} fontWeight={700} fill={col}>{n}{pc.entry.subject||""}</text>
-          <text x={g.to.x+g.to.w/2} y={g.to.y+g.to.h/2+14} textAnchor="middle" fontSize={10} fill={col}>ここに移動</text>
+          <text x={g.to.x+g.to.w/2} y={g.to.y+g.to.h/2+14} textAnchor="middle" fontSize={10} fill={col}>{g.to.other?"（別の授業）":"ここに移動"}</text>
         </g>}
         {g.from&&g.to&&(()=>{
           const a=c(g.from),b=c(g.to);
@@ -9029,7 +9146,7 @@ function RotatePreviewOverlay({pieces,dateMode}){
   // 【v8_7_40】表示倍率（zoom）の内側に描くと位置がずれるため、document.body 直下に描く（座標は画面上の実際の位置）
   return createPortal(
     <>
-      <svg style={{position:"fixed",inset:0,width:"100vw",height:"100vh",pointerEvents:"none",zIndex:650}}>
+      <svg className="rp-overlay" style={{position:"fixed",inset:0,width:"100vw",height:"100vh",pointerEvents:"none",zIndex:650}}>
         <defs>{colors.map((col,i)=><marker key={i} id={`rp-arrow-${i}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill={col}/></marker>)}</defs>
         {parts}
       </svg>
@@ -9039,24 +9156,11 @@ function RotatePreviewOverlay({pieces,dateMode}){
   );
 }
 
-function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainSwap,viewDate,onJumpDate,canJumpDate,viewDay,onJumpDay,onFocusSlot,onPulseCells,onClose}){
+function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainSwap,viewDate,onJumpDate,canJumpDate,viewDay,onJumpDay,slotApi,onClose}){
   const{srcEntry,srcDc,tgtEntry,tgtDc,candidates,execDirect,via}=chainModal; // via: 空きセルで重なる授業(tgtEntry)をどかす形【v8_7_40】
   const[hov,setHov]=useState(null); // 【v8_7_38】マウスを乗せている候補の番号
-  // 【v8_7_40】「〇曜〇限」の文字に乗せると、そのセルを点滅（重複解消パネルと同じ仕組み）。閉じたら必ず消す
-  useEffect(()=>()=>{onPulseCells&&onPulseCells(null);},[]);
-  // 【v8_7_40】見えていない先生・曜日・日付への切り替えは、文字の上で0.3秒止めたときだけ（通り過ぎただけでは切り替えない）
-  const focusTimerRef=React.useRef(null);
-  useEffect(()=>()=>clearTimeout(focusTimerRef.current),[]);
-  const leaveSlot=()=>{clearTimeout(focusTimerRef.current);onPulseCells&&onPulseCells(null);};
-  const pulseSlot=(en,slot,kind)=>{
-    clearTimeout(focusTimerRef.current);
-    if(!slot)return;
-    const day=slot.day||(slot.date?["日","月","火","水","木","金","土"][new Date(slot.date+"T00:00:00").getDay()]:undefined);
-    const spec={date:slot.date||null,day,period:slot.period,tids:en.teacherIds||[],cids:en.classIds||[],kind};
-    if(onPulseCells)onPulseCells([spec]);
-    // 切り替えたあとに出てきたセルにも点滅を当て直す（同じ指定を新しく渡して点滅を再適用させる）
-    if(onFocusSlot)focusTimerRef.current=setTimeout(()=>{onFocusSlot(slot,en);onPulseCells&&onPulseCells([{...spec}]);},300);
-  };
+  // 【v8_7_42】「〇曜〇限」は共通部品 SlotLink（乗せて点滅、0.3秒止めるかクリックでその場所を表示）。閉じたら点滅を消す
+  useEffect(()=>()=>{slotApi&&slotApi.leave();},[]);
   const cn=id=>classes.find(c=>c.id===id)?.name||id;
   const tn=id=>teachers.find(t=>t.id===id)?.name||id;
   const DAYS7=["日","月","火","水","木","金","土"]; // getDay()用（日曜始まり）
@@ -9148,11 +9252,9 @@ function ChainSwapModal({chainModal,base,dateMode,classes,teachers,executeChainS
                               <span style={{background:col,color:"white",borderRadius:"50%",width:16,height:16,fontSize:10,fontWeight:700,display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{k+1}</span>
                               <b style={{color:"#1E293B"}}>{en.subject}</b>
                               <span style={{color:"#64748B",fontSize:11,overflow:"hidden",textOverflow:"ellipsis"}}>{(en.classIds||[]).map(c=>cn(c)).join("・")}</span>
-                              <span style={{color:"#94A3B8",fontSize:11,cursor:"help",textDecoration:"underline dotted",textUnderlineOffset:2}}
-                                onMouseEnter={()=>pulseSlot(en,from,'from')} onMouseLeave={leaveSlot}>{slotLabel(en,from)}</span>
+                              <SlotLink slot={from} entry={en} kind="from" api={slotApi} label={slotLabel(en,from)} style={{color:"#94A3B8",fontSize:11}}/>
                               <span style={{color:col,fontWeight:700}}>→</span>
-                              <span style={{color:col,fontSize:11,fontWeight:600,cursor:"help",textDecoration:"underline dotted",textUnderlineOffset:2}}
-                                onMouseEnter={()=>pulseSlot(en,to,'to')} onMouseLeave={leaveSlot}>{slotLabel(en,to)}</span>
+                              <SlotLink slot={to} entry={en} kind="to" api={slotApi} label={slotLabel(en,to)} style={{color:col,fontSize:11,fontWeight:600}}/>
                               {(()=>{
                                 // 【v8_7_40】行き先（それが見えていれば元の位置）が、表示中の日・曜日と違えば「〜を見る」ボタンを出す。
                                 //   週間日課変更は日付で、基本時間割の授業者一覧（1日ずつ表示）は曜日で切り替える。
@@ -9903,7 +10005,7 @@ function AdminManagerModal({currentEmail,onClose}){
 // ── ConflictTrialPanel ────────────────────────────────────────────────────────
 // ドロップ後に右からスライドインするトライアルパネル
 // ステップ: select（候補選択） → preview（適用済み確認中） → done（確定済み）
-function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMinimizeChange}){
+function ConflictTrialPanel({modal,classes,teachers,dateMode,slotApi,onClose,onUndo,onMinimizeChange}){
   // 【v8_7_40】候補にマウスを乗せている間、動く駒の番号と矢印を時間割の上に描く（3コマ回転と同じ RotatePreviewOverlay）
   const[arrowPieces,setArrowPieces]=React.useState(null);
   const{srcEntry,srcDc,tgtDc,hasClassConflict,hasTeacherConflict,conflictItems,
@@ -10027,12 +10129,9 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
   };
   // スロット表記を、ホバーでそのセルだけ点滅させる下線付きラベルにする。
   // 離れたらカード全体のハイライト(fullCells)へ戻す。
+  // 【v8_7_42】共通部品 SlotLink に統一（0.3秒止めるかクリックで、その先生・曜日・日を表示）。離れたらカード全体のハイライトへ戻す
   const SlotChip=({piece,slot,kind,fullCells})=>(
-    <b style={{cursor:'help',textDecoration:'underline dotted',textUnderlineOffset:2}}
-       onMouseEnter={()=>{onFocusSlot&&onFocusSlot(slot);onPulseCells&&onPulseCells([mkCell(piece,slot,kind)]);}}
-       onMouseLeave={()=>onPulseCells&&onPulseCells(fullCells)}>
-      {slotLabel(slot)}
-    </b>
+    <SlotLink slot={normSlot(slot)} entry={piece} kind={kind} api={slotApi} label={slotLabel(slot)} restore={fullCells} style={{fontWeight:700}}/>
   );
 
   // 全ての重複相手が解消済みかどうか
@@ -10110,12 +10209,12 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
       if(!r)return;
       if(r.chain&&(r.chain.steps||[]).length){
         (r.chain.steps||[]).forEach(st=>{
-          lines.push(`${n++}. ↪どかす ${lbl(st.entry)}${slotLabel(st.from)} → ${slotLabel(st.to)}`);
+          lines.push([`${n++}. ↪どかす ${lbl(st.entry)}`,{slot:normSlot(st.from),entry:st.entry,kind:'from'},' → ',{slot:normSlot(st.to),entry:st.entry,kind:'to'}]);
         });
       }
-      lines.push(`${n++}. ${lbl(it.entry)}${slotLabel(tgtDc)} → ${slotLabel(r.slot)}`);
+      lines.push([`${n++}. ${lbl(it.entry)}`,{slot:normSlot(tgtDc),entry:it.entry,kind:'from'},' → ',{slot:normSlot(r.slot),entry:it.entry,kind:'to'}]);
     });
-    lines.push(`${n++}. ${lbl(srcEntry)}${slotLabel(srcDc)} → ${slotLabel(tgtDc)}`);
+    lines.push([`${n++}. ${lbl(srcEntry)}`,{slot:normSlot(srcDc),entry:srcEntry,kind:'from'},' → ',{slot:normSlot(tgtDc),entry:srcEntry,kind:'to'}]);
     onConfirmAfterPreview(lines);
     setStep('done');
     setTimeout(()=>onClose(),1200);
@@ -10137,13 +10236,9 @@ function ConflictTrialPanel({modal,classes,teachers,dateMode,onClose,onUndo,onMi
         <div style={{color:'#1D4ED8',fontWeight:700,marginBottom:3}}>移動する駒</div>
         <div style={{color:'#1E293B',fontWeight:600}}>{entryLabel(srcEntry)}</div>
         <div style={{color:'#64748B',marginTop:2,fontSize:11}}>
-          <b style={{cursor:'help',textDecoration:'underline dotted',textUnderlineOffset:2}}
-             onMouseEnter={()=>{onFocusSlot&&onFocusSlot(srcDc);onPulseCells&&onPulseCells([mkCell(srcEntry,srcDc,'from')]);}}
-             onMouseLeave={()=>onPulseCells&&onPulseCells(null)}>{slotLabel(srcDc)}</b>
+          <SlotLink slot={normSlot(srcDc)} entry={srcEntry} kind="from" api={slotApi} label={slotLabel(srcDc)} style={{fontWeight:700}}/>
           {' → '}
-          <b style={{color:'#1D4ED8',cursor:'help',textDecoration:'underline dotted',textUnderlineOffset:2}}
-             onMouseEnter={()=>{onFocusSlot&&onFocusSlot(tgtDc);onPulseCells&&onPulseCells([mkCell(srcEntry,tgtDc,'to')]);}}
-             onMouseLeave={()=>onPulseCells&&onPulseCells(null)}>{slotLabel(tgtDc)}</b>
+          <SlotLink slot={normSlot(tgtDc)} entry={srcEntry} kind="to" api={slotApi} label={slotLabel(tgtDc)} style={{color:'#1D4ED8',fontWeight:700}}/>
         </div>
       </div>
 
