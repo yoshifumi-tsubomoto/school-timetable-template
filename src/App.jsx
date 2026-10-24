@@ -16,7 +16,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_47";
+const APP_VERSION="8_7_48";
 // 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
 const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
@@ -1004,6 +1004,11 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   },[]);
   const[dbLoaded,setDbLoaded]=useState(false);
   const[saving,setSaving]=useState(false);
+  // 【v8_7_48】楽観ロック（同時編集ガード）：サーバー上の updated_at（サーバーが返した文字列をそのまま保持）
+  //   保存のたびに「自分が読み込んだ／最後に保存した版」と一致するときだけ更新する。0件更新＝ほかの人が先に保存した。
+  const lastSavedAtRef=useRef(null);
+  const[saveConflict,setSaveConflict]=useState(false); // 保存を止めているか（"conflict"＝ほかの人が先に保存／"auth"＝ログイン切れなどで保存できない）
+  const saveChainRef=useRef(Promise.resolve());        // 保存を1つずつ順に行う（前の保存が終わる前に次を送ると、古い版で比べて競合と誤判定するため）
 
   const historyRef=useRef([]);
   const redoRef=useRef([]);
@@ -1039,6 +1044,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         }else{
           const res=await sbFetch('/rest/v1/timetable_data?id=eq.main');
           rows=await res.json();
+          if(Array.isArray(rows)&&rows[0]?.updated_at)lastSavedAtRef.current=rows[0].updated_at; // 【v8_7_48】読み込んだ時点の版
         }
         const d=rows[0]?.data||{};
         if(usePublished&&rows[0]?.published_at) setPublishedAt(rows[0].published_at);
@@ -1066,19 +1072,40 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
 
   useEffect(()=>{
     if(!dbLoaded)return;
+    if(saveConflict)return; // 【v8_7_48】競合を見つけたあとは、再読み込みするまで保存しない
     setSaving(true);
-    const t=setTimeout(async()=>{
-      try{
-        await sbFetch('/rest/v1/timetable_data?id=eq.main',{
-          method:'PATCH',
-          headers:{'Prefer':'return=minimal'},
-          body:JSON.stringify({data:saveRef.current,updated_at:new Date().toISOString()}),
-        });
-      }catch(e){console.error('Supabase save error',e);}
-      setSaving(false);
+    const t=setTimeout(()=>{
+      // 【v8_7_48】前の保存が終わってから送る（版の比べ間違いを防ぐ）
+      saveChainRef.current=saveChainRef.current.then(async()=>{
+        try{
+          // 自分が読み込んだ／最後に保存した版と一致するときだけ更新する
+          const guard=lastSavedAtRef.current?`&updated_at=eq.${encodeURIComponent(lastSavedAtRef.current)}`:'';
+          const res=await sbFetch(`/rest/v1/timetable_data?id=eq.main${guard}`,{
+            method:'PATCH',
+            headers:{'Prefer':'return=representation'},
+            body:JSON.stringify({data:saveRef.current,updated_at:new Date().toISOString()}),
+          });
+          const rows=await res.json().catch(()=>null);
+          if(Array.isArray(rows)&&rows[0]?.updated_at){
+            lastSavedAtRef.current=rows[0].updated_at; // 保存できた：サーバーが返した値で版を更新
+          }else if(guard&&res.ok&&Array.isArray(rows)&&rows.length===0){
+            // 0件更新：サーバーの版を読み直して、①ほかの人が先に保存した ②ログイン切れなどで保存できない を見分ける
+            let now=null;
+            try{const r2=await sbFetch('/rest/v1/timetable_data?id=eq.main&select=updated_at');const j=await r2.json();now=Array.isArray(j)&&j[0]?.updated_at||null;}catch(_){}
+            if(now&&now!==lastSavedAtRef.current){
+              setSaveConflict("conflict");
+              alert('⚠ ほかの人（または別のタブ・別のパソコン）が先に保存したため、この画面からの保存を止めました。\nページを再読み込みして最新の内容を確認してから、作業をやり直してください。\n（この画面で加えた直近の変更は保存されていません）');
+            }else{
+              setSaveConflict("auth");
+              alert('⚠ 保存できませんでした（ログインの期限切れなどの可能性があります）。この画面からの保存を止めました。\nページを再読み込みして、ログインし直してから、作業をやり直してください。\n（この画面で加えた直近の変更は保存されていません）');
+            }
+          }
+        }catch(e){console.error('Supabase save error',e);}
+        setSaving(false);
+      });
     },1000);
     return()=>clearTimeout(t);
-  },[base,changes,teachers,schoolName,adminEmails,classes,subjects,weeklyPlan,schoolSlots,dayPatterns,periodDefs,activePeriodId,savedPeriodBases,meetings,teacherDateOverrides,abWeekBase,dbLoaded]);
+  },[base,changes,teachers,schoolName,adminEmails,classes,subjects,weeklyPlan,schoolSlots,dayPatterns,periodDefs,activePeriodId,savedPeriodBases,meetings,teacherDateOverrides,abWeekBase,dbLoaded,saveConflict]);
 
   // ── 定期自動バックアップ（15分ごと・変更があった時のみ）──────────────────
   const lastBackupDataRef=useRef(null);
@@ -4901,7 +4928,10 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         {/* ステータス */}
         {dragVisual
           ?<span style={{background:"#3B82F6",borderRadius:4,padding:"2px 8px",fontSize:11,flexShrink:0}}>✦ {dragVisual.label} 移動中</span>
-          :(saving
+          :(saveConflict
+            ?<span onClick={()=>window.location.reload()} title={saveConflict==="auth"?"保存できませんでした（ログイン切れなど）。クリックで再読み込みします":"ほかの人（または別のタブ）が先に保存しました。クリックで再読み込みします"}
+               style={{background:"#DC2626",borderRadius:4,padding:"2px 8px",fontSize:11,flexShrink:0,cursor:"pointer",fontWeight:700}}>⚠ 保存停止中・要再読込</span>
+            :saving
             ?<span style={{background:"#F59E0B",borderRadius:4,padding:"2px 8px",fontSize:11,flexShrink:0}}>💾 保存中</span>
             :<span style={{background:"#22C55E",borderRadius:4,padding:"2px 8px",fontSize:11,flexShrink:0}}>✓ 保存済</span>)
         }
