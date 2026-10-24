@@ -16,7 +16,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_46";
+const APP_VERSION="8_7_47";
 // 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
 const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
@@ -4879,6 +4879,8 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
       {/* ── Header（1行目）── */}
       <div style={{background:"#1E3A5F",color:"white",padding:"0 12px",display:"flex",alignItems:"center",height:46,gap:8,overflowX:"auto",scrollbarWidth:"none",flexShrink:0}}>
         <span style={{fontSize:18,flexShrink:0}}>📚</span>
+        {/* 【v8_7_47】アプリの愛称「コマナビ」を学校名の前に小さく出す */}
+        <span title="コマナビ（時間割アプリ）" style={{fontSize:11,fontWeight:800,whiteSpace:"nowrap",flexShrink:0,background:"rgba(255,255,255,0.16)",border:"1px solid rgba(255,255,255,0.35)",borderRadius:4,padding:"1px 6px",letterSpacing:"0.06em"}}>コマナビ</span>
         <span style={{fontWeight:700,fontSize:14,whiteSpace:"nowrap",flexShrink:0,letterSpacing:"0.02em"}}>{schoolName} 時間割</span>
         <span style={{fontSize:10,fontWeight:600,color:"rgba(255,255,255,0.55)",whiteSpace:"nowrap",flexShrink:0,letterSpacing:"0.02em"}} title={BUILD_TAG?`プレビュー：コミット ${BUILD_TAG}`:undefined}>v{APP_VERSION}{BUILD_TAG&&<span style={{marginLeft:4,padding:"0 4px",borderRadius:3,background:"rgba(255,255,255,0.18)",color:"rgba(255,255,255,0.85)",fontFamily:"monospace"}}>{BUILD_TAG}</span>}</span>
         {isDemo&&(
