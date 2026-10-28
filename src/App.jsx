@@ -16,7 +16,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_49";
+const APP_VERSION="8_7_50";
 // 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
 const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
@@ -1015,7 +1015,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const historyRef=useRef([]);
   const redoRef=useRef([]);
   const currentRef=useRef({base,changes,dayPatterns});
-  currentRef.current={base,changes,dayPatterns};
+  currentRef.current={base,changes,dayPatterns,bench}; // 【v8_7_50】待機（bench）も取消の対象にする
   const nameRef=useRef({classes:[],teachers:[]});nameRef.current={classes,teachers}; // 【v8_7_37】取消/やり直しの説明用（ショートカットは古いクロージャで動くのでrefで読む）
   // トライアルパネル（衝突解消）開始前の状態スナップショット。やり直し/キャンセルで確実に復元する用。
   const trialSnapRef=useRef(null);
@@ -1133,17 +1133,21 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
   const prevBaseRef=useRef(base);
   const prevChangesRef=useRef(changes);
   const prevDayPatternsRef=useRef(dayPatterns);
+  // 【v8_7_50】待機（bench）も履歴に入れる。以前は記録しておらず、待機へ置いた駒を取消（Ctrl+Z）すると、
+  //   時間割には駒が戻るのに待機にも残り、同じ駒が2か所にある状態になっていた。
+  const prevBenchRef=useRef(bench);
   const skipHistoryRef=useRef(false); // switchPeriod等でskipする場合true
   useEffect(()=>{
     if(skipHistoryRef.current){
       prevBaseRef.current=base;
       prevChangesRef.current=changes;
       prevDayPatternsRef.current=dayPatterns;
+      prevBenchRef.current=bench;
       skipHistoryRef.current=false;
       return;
     }
-    if(base===prevBaseRef.current&&changes===prevChangesRef.current&&dayPatterns===prevDayPatternsRef.current)return;
-    const snapshot={base:prevBaseRef.current,changes:prevChangesRef.current,dayPatterns:prevDayPatternsRef.current};
+    if(base===prevBaseRef.current&&changes===prevChangesRef.current&&dayPatterns===prevDayPatternsRef.current&&bench===prevBenchRef.current)return;
+    const snapshot={base:prevBaseRef.current,changes:prevChangesRef.current,dayPatterns:prevDayPatternsRef.current,bench:prevBenchRef.current};
     historyRef.current=[...historyRef.current.slice(-MAX_HISTORY+1),snapshot];
     redoRef.current=[];
     setHistoryLen(historyRef.current.length);
@@ -1151,7 +1155,8 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     prevBaseRef.current=base;
     prevChangesRef.current=changes;
     prevDayPatternsRef.current=dayPatterns;
-  },[base,changes,dayPatterns]);
+    prevBenchRef.current=bench;
+  },[base,changes,dayPatterns,bench]);
   const saveHistory=()=>{}; // useEffect自動保存に統一（後方互換のため残す）
   const setBaseH=fn=>setBase(fn);
   const setChangesH=fn=>setChanges(fn);
@@ -2544,6 +2549,13 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     if(blk)lines.push(`出張・欠課などの入力${blk}件`);
     if(blkDel)lines.push(`出張・欠課などの入力${blkDel}件の取り消し`);
     if(JSON.stringify(from.dayPatterns)!==JSON.stringify(to.dayPatterns))lines.push("日課パターンの変更");
+    // 【v8_7_50】待機の出し入れ
+    const bIds=b=>new Set((b||[]).filter(Boolean).map(e=>e.id));
+    if(from.bench!==undefined&&to.bench!==undefined){
+      const fb=bIds(from.bench),tb=bIds(to.bench);
+      (to.bench||[]).filter(e=>e&&!fb.has(e.id)).forEach(e=>lines.push(`待機へ：${lab(e)}`));
+      (from.bench||[]).filter(e=>e&&!tb.has(e.id)).forEach(e=>lines.push(`待機から出す：${lab(e)}`));
+    }
     return lines.length?lines:["変更"];
   };
   // 次に取り消す／やり直す操作の説明
@@ -2560,6 +2572,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     setBase(prev.base);
     setChanges(prev.changes);
     if(prev.dayPatterns!==undefined)setDayPatterns(prev.dayPatterns);
+    if(prev.bench!==undefined)setBench(prev.bench); // 【v8_7_50】待機も戻す
     setHistoryLen(historyRef.current.length);
   };
   const redo=()=>{
@@ -2572,6 +2585,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
     setBase(next.base);
     setChanges(next.changes);
     if(next.dayPatterns!==undefined)setDayPatterns(next.dayPatterns);
+    if(next.bench!==undefined)setBench(next.bench); // 【v8_7_50】待機もやり直す
     setHistoryLen(historyRef.current.length);
   };
 
@@ -3768,7 +3782,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
                 }catch(_){}
               })();
               // 【v8_7_46】開始前の履歴と状態（確定したら、パネル中の変更を履歴1回分にまとめる）
-              trialHistRef.current={hist:historyRef.current.slice(),pre:{base:currentRef.current.base,changes:currentRef.current.changes,dayPatterns:currentRef.current.dayPatterns}};
+              trialHistRef.current={hist:historyRef.current.slice(),pre:{base:currentRef.current.base,changes:currentRef.current.changes,dayPatterns:currentRef.current.dayPatterns,bench:currentRef.current.bench}};
               // トライアル開始前の状態を保存（やり直し/キャンセルで一発復元するため）
               trialSnapRef.current={
                 base:JSON.parse(JSON.stringify(currentRef.current.base)),
@@ -4982,7 +4996,7 @@ export default function App({user,authDebug,onLogout,classParam,modeParam,isAdmi
         <button onClick={redo} title="やり直す（Ctrl+Y）" onMouseEnter={e=>{e.currentTarget.title=redoTip();}} style={{background:"rgba(255,255,255,0.12)",border:"1px solid rgba(255,255,255,0.25)",color:"white",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:11,flexShrink:0,whiteSpace:"nowrap"}}>↪ やり直し</button>
         <div style={{width:1,height:18,background:"rgba(255,255,255,0.25)",flexShrink:0,margin:"0 2px"}}/>
 
-        <HoverMenu icon="🔄" label="ビュー切り替え" items={[
+        <HoverMenu icon="🔄" label="ビュー" items={[
           {icon:"👤",label:"生徒ビュー",desc:"生徒・保護者向けの見え方",color:"#15803D",hover:"#F0FDF4",onClick:()=>setStudentMode(true)},
           {icon:"👩‍🏫",label:"教員ビュー",desc:"先生向けの見え方",color:"#1D4ED8",hover:"#EFF6FF",onClick:()=>setTeacherMode(true)},
         ]}/>
@@ -7686,7 +7700,7 @@ function BackupDropdown({saveRef,saving,setSaving,setBackupModal,base,setBase,ch
           fontSize:11,fontWeight:700,whiteSpace:'nowrap',
           display:'flex',alignItems:'center',gap:5,
         }}>
-        📦 バックアップ関連
+        📦 バックアップ
         <span style={{fontSize:9,opacity:0.8}}>{open?'▲':'▼'}</span>
       </button>
 
@@ -7699,7 +7713,7 @@ function BackupDropdown({saveRef,saving,setSaving,setBackupModal,base,setBase,ch
         }}>
           <div style={{padding:'10px 14px 8px',borderBottom:'1px solid #F1F5F9',
             fontSize:11,fontWeight:700,color:'#94A3B8',letterSpacing:'0.05em'}}>
-            バックアップ関連
+            バックアップ
           </div>
 
           <button
