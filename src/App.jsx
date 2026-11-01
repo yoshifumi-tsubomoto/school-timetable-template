@@ -16,7 +16,7 @@ const IS_DEMO=(()=>{
 
 // ── アプリのバージョン ───────────────────────────────────────────────────────
 // ヘッダーの学校名のとなりに表示される。新しい版を出すたびにこの値を更新する。
-const APP_VERSION="8_7_50";
+const APP_VERSION="8_7_51";
 // 【v8_7_40】プレビューのときだけ、コミット番号の先頭7文字（vite.config.js で埋め込み）。本番では空
 const BUILD_TAG=(typeof __BUILD_TAG__!=="undefined"&&__BUILD_TAG__)||"";
 
@@ -6925,7 +6925,21 @@ function EditModal({modal,base,changes,teachers,classes,subjects,dateMode,substS
 }
 
 // ── AssignGrid ────────────────────────────────────────────────────────────────
-function AssignGrid({teacher,classes,subjects,setTeachers}){
+function AssignGrid({teacher,classes,subjects,setTeachers,maxH}){
+  // 【v8_7_51】表の枠を、初期設定の画面の下端まで広げる（画面の大きさを変えたら合わせ直す）。横スクロールバーが画面の中に見えるように。
+  const boxRef=React.useRef(null);
+  const[fitH,setFitH]=React.useState(null);
+  React.useLayoutEffect(()=>{
+    const fit=()=>{
+      const el=boxRef.current;if(!el)return;
+      const body=el.closest('[data-setup-body]');if(!body)return;
+      const b=body.getBoundingClientRect(),r=el.getBoundingClientRect();
+      setFitH(Math.max(180,Math.floor(b.bottom-r.top-18)));
+    };
+    fit();
+    window.addEventListener('resize',fit);
+    return()=>window.removeEventListener('resize',fit);
+  },[maxH,teacher?.id]);
   const getN=(c,s)=>(teacher.asgn||[]).find(a=>a.c===c&&a.s===s)?.n||0;
   const setN=(c,s,v)=>{
     const n=Math.max(0,Math.min(10,Number(v)||0));
@@ -6948,7 +6962,9 @@ function AssignGrid({teacher,classes,subjects,setTeachers}){
           🔄 全てゼロにリセット
         </button>
       </div>
-      <div style={{overflowX:"auto",overflowY:"auto",maxHeight:"60vh",position:"relative"}}>
+      {/* 【v8_7_51】表の枠の高さを初期設定の画面に収まるようにする（以前は画面の60%で、横スクロールバーが画面の外に隠れていた） */}
+      <div style={{fontSize:10.5,color:"#94A3B8",marginBottom:4}}>学級が多いときは、表を横にスクロールして見ます（下のスクロールバー、または Shift＋マウスホイール）。</div>
+      <div ref={boxRef} style={{overflowX:"auto",overflowY:"auto",maxHeight:fitH||maxH||"60vh",position:"relative"}}>
         <table style={{borderCollapse:"collapse",fontSize:12}}>
           <thead>
             <tr>
@@ -7039,7 +7055,8 @@ function SetupModal({schoolName,setSchoolName,adminEmails,setAdminEmails,classes
   const addTch=()=>{if(!newTch.trim())return;const id="T"+(Date.now()%100000).toString().padStart(4,"0");setTeachers(p=>[...p,{id,name:newTch.trim(),asgn:[]}]);setNewTch("");};
   const delTch=id=>setTeachers(p=>p.filter(t=>t.id!==id));
   const TABS=[{k:"school",l:"🏫 学校情報"},{k:"class",l:"📋 学級設定"},{k:"subject",l:"📚 教科設定"},{k:"teacher",l:"➕ 教員追加/削除"},{k:"assign",l:"👤 担当・コマ数"},{k:"holiday",l:"🗓 祝日登録"}];
-  const[modalSize,setModalSize]=React.useState({w:660,h:Math.min(600,window.innerHeight*0.9)});
+  // 【v8_7_51】初めから大きめに開く（担当・コマ数の表が、学級が多くても見やすいように）
+  const[modalSize,setModalSize]=React.useState({w:Math.min(1360,window.innerWidth*0.94),h:Math.min(820,window.innerHeight*0.9)});
   const isResizingRef=React.useRef(false);
   const startResize=(e,dir)=>{
     e.preventDefault();
@@ -7095,7 +7112,7 @@ function SetupModal({schoolName,setSchoolName,adminEmails,setAdminEmails,classes
             ))}
           </div>
         </div>
-        <div style={{overflowY:"auto",flex:1,padding:"16px 20px"}}>
+        <div data-setup-body="1" style={{overflowY:"auto",flex:1,padding:"16px 20px"}}>
           {tab==="school"&&(
             <div>
               <div style={{fontSize:12,color:"#64748B",marginBottom:14}}>学校名を設定します。ヘッダーに表示されます。</div>
@@ -7259,7 +7276,7 @@ function SetupModal({schoolName,setSchoolName,adminEmails,setAdminEmails,classes
                 ))}
               </div>
               {teachers.find(t=>t.id===selCls)&&
-                <AssignGrid teacher={teachers.find(t=>t.id===selCls)} classes={classes} subjects={subjects} setTeachers={setTeachers}/>
+                <AssignGrid teacher={teachers.find(t=>t.id===selCls)} classes={classes} subjects={subjects} setTeachers={setTeachers} maxH={Math.max(180,(modalSize?.h||600)-420)}/>
               }
             </div>
           )}
